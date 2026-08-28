@@ -9,6 +9,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -77,6 +78,35 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
         ret.push_back(dis(gen));
     }
     return ret;
+}
+
+static constexpr uint32_t qwen4exp_ple_image_token_id = 126;
+
+static void test_qwen4exp_ple_metadata_save() {
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
+    GGML_ASSERT(model);
+
+    llama_hparams & hparams = model->hparams;
+    hparams.n_layer_all = 1;
+    hparams.ple_n_heads = 1;
+    hparams.ple_ngram_size = 2;
+    hparams.ple_heads_per_ngram = 1;
+    hparams.ple_conv_kernel = 2;
+    hparams.ple_eos_token_id = 127;
+    hparams.ple_image_token_id = qwen4exp_ple_image_token_id;
+    hparams.ple_head_dim = 1;
+    hparams.is_ple_impl.set(0);
+    hparams.ple_layer_multipliers[0] = 1;
+    hparams.ple_layer_multipliers[1] = 2;
+    hparams.ple_head_vocab_sizes[0] = 1;
+
+    llama_model_saver saver(model.get());
+    saver.add_kv_from_model();
+
+    const std::string key = LLM_KV(model->arch)(LLM_KV_PLE_IMAGE_TOKEN_ID);
+    const int64_t key_id = gguf_find_key(saver.gguf_ctx, key.c_str());
+    GGML_ASSERT(key_id >= 0);
+    GGML_ASSERT(gguf_get_val_u32(saver.gguf_ctx, key_id) == qwen4exp_ple_image_token_id);
 }
 
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
@@ -589,6 +619,10 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
 }
 
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
+        test_qwen4exp_ple_metadata_save();
+    }
+
     struct user_data_t {
         struct {
             ggml_log_callback callback;
