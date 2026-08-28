@@ -86,6 +86,10 @@ static void test_qwen4exp_ple_metadata_save() {
     std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_QWEN4EXP, llama_model_default_params()));
     GGML_ASSERT(model);
 
+    const std::string chat_template_key = LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
+    const std::string chat_template = "{% for message in messages %}{{ message.content }}{% endfor %}";
+    model->gguf_kv.emplace(chat_template_key, chat_template);
+
     llama_hparams & hparams = model->hparams;
     hparams.n_layer_all = 1;
     hparams.ple_n_heads = 1;
@@ -107,6 +111,11 @@ static void test_qwen4exp_ple_metadata_save() {
     const int64_t key_id = gguf_find_key(saver.gguf_ctx, key.c_str());
     GGML_ASSERT(key_id >= 0);
     GGML_ASSERT(gguf_get_val_u32(saver.gguf_ctx, key_id) == qwen4exp_ple_image_token_id);
+
+    const int64_t chat_template_key_id = gguf_find_key(saver.gguf_ctx, chat_template_key.c_str());
+    GGML_ASSERT(chat_template_key_id >= 0);
+    GGML_ASSERT(gguf_get_kv_type(saver.gguf_ctx, chat_template_key_id) == GGUF_TYPE_STRING);
+    GGML_ASSERT(chat_template == gguf_get_val_str(saver.gguf_ctx, chat_template_key_id));
 }
 
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool ple = false) {

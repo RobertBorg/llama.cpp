@@ -405,6 +405,10 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_TOKENIZER_PRECOMPILED_CHARSMAP,    vocab.get_precompiled_charsmap());
     // add_kv(LLM_KV_TOKENIZER_HF_JSON,                 ???);
     // add_kv(LLM_KV_TOKENIZER_RWKV,                    ???);
+    const auto chat_template = model->gguf_kv.find(llm_kv(LLM_KV_TOKENIZER_CHAT_TEMPLATE));
+    if (chat_template != model->gguf_kv.end()) {
+        add_kv(LLM_KV_TOKENIZER_CHAT_TEMPLATE, chat_template->second.c_str());
+    }
     add_kv(LLM_KV_TOKENIZER_FIM_PRE_ID,              uint32_t(vocab.token_fim_pre()));
     add_kv(LLM_KV_TOKENIZER_FIM_SUF_ID,              uint32_t(vocab.token_fim_suf()));
     add_kv(LLM_KV_TOKENIZER_FIM_MID_ID,              uint32_t(vocab.token_fim_mid()));
