@@ -295,7 +295,9 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
                   llama_context * lctx,
                            bool   optimize) :
     llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem) {}
+    mem(mem),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        mem->get_mem_idx()->init_update(lctx, optimize)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

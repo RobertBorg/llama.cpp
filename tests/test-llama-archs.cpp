@@ -377,7 +377,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -388,6 +388,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
+    ctx_params.n_seq_max = n_seq_max;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -409,14 +410,15 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false,
+        llama_seq_id seq_id = 0, llama_pos pos_offset = 0) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
     llama_batch batch = llama_batch_init(n_ctx, 0, 1);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        common_batch_add(batch, tokens[pos], pos_offset + pos, {seq_id}, true);
     }
     batch.n_tokens = n_tokens;
     if (encode) {
@@ -440,6 +442,33 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_qwen4exp_indexer_seq_cp() {
+    constexpr size_t   seed     = 3321213324;
+    constexpr uint32_t n_prompt = 32;
+    constexpr uint32_t n_vocab  = 128;
+
+    gguf_context_ptr gguf_ctx_ref = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto ref = get_model_and_ctx(gguf_ctx_ref.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2);
+
+    gguf_context_ptr gguf_ctx_copy = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto copy = get_model_and_ctx(gguf_ctx_copy.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2);
+
+    const std::vector<llama_token> source = get_tokens(n_prompt, n_vocab, seed);
+    const std::vector<llama_token> poison = get_tokens(n_prompt, n_vocab, seed + 1);
+    const llama_token next = get_tokens(1, n_vocab, seed + 2)[0];
+
+    get_logits(ref.first.get(), ref.second.get(), source, false, 0);
+    get_logits(copy.first.get(), copy.second.get(), source, false, 0);
+    get_logits(copy.first.get(), copy.second.get(), poison, false, 1);
+
+    const std::vector<float> expected = get_logits(ref.first.get(), ref.second.get(), { next }, false, 0, n_prompt);
+
+    llama_memory_seq_cp(llama_get_memory(copy.second.get()), 0, 1, -1, -1);
+    const std::vector<float> actual = get_logits(copy.first.get(), copy.second.get(), { next }, false, 1, n_prompt);
+
+    GGML_ASSERT(actual == expected);
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -621,6 +650,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
         test_qwen4exp_ple_metadata_save();
+        test_qwen4exp_indexer_seq_cp();
     }
 
     struct user_data_t {
