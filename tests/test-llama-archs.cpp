@@ -13,6 +13,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -416,7 +417,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1,
-        bool kv_unified = false) {
+        bool kv_unified = false, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -431,6 +432,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.kv_unified = kv_unified;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -567,6 +570,139 @@ static void test_qwen4exp_qsa_non_causal() {
         changed |= logits_a[i] != logits_b[i];
     }
     GGML_ASSERT(changed);
+}
+
+struct qwen4exp_qsa_capture {
+    int64_t n_blocks = 0;
+    int64_t query = -1;
+    int64_t selected = -1;
+    std::vector<int32_t> block_pos;
+};
+
+static float qwen4exp_qsa_get_f32(const ggml_tensor * tensor, const std::vector<uint8_t> & data, size_t offset) {
+    if (tensor->type == GGML_TYPE_F32) {
+        float value;
+        memcpy(&value, data.data() + offset, sizeof(value));
+        return value;
+    }
+
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    ggml_fp16_t value;
+    memcpy(&value, data.data() + offset, sizeof(value));
+    return ggml_fp16_to_fp32(value);
+}
+
+static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * capture = static_cast<qwen4exp_qsa_capture *>(user_data);
+
+    const bool block_pos = capture->block_pos.empty() && capture->n_blocks > 0 &&
+        tensor->op == GGML_OP_ROPE && tensor->src[1] != nullptr &&
+        ggml_nelements(tensor->src[1]) == 4*capture->n_blocks && tensor->ne[2] == capture->n_blocks;
+    const bool old_selection = capture->selected < 0 && capture->query >= 0 &&
+        tensor->op == GGML_OP_SET_ROWS && tensor->src[1] != nullptr &&
+        strncmp(tensor->src[1]->name, "indexer_top_k-", strlen("indexer_top_k-")) == 0;
+    const bool qsa_mask = capture->selected < 0 && capture->query >= 0 &&
+        strncmp(tensor->name, "qsa_mask-", strlen("qsa_mask-")) == 0;
+
+    if (ask) {
+        return block_pos || old_selection || qsa_mask;
+    }
+
+    if (block_pos) {
+        capture->block_pos.resize(4*capture->n_blocks);
+        ggml_backend_tensor_get(tensor->src[1], capture->block_pos.data(), 0, capture->block_pos.size()*sizeof(int32_t));
+    }
+
+    if (old_selection || qsa_mask) {
+        GGML_ASSERT(capture->query < tensor->ne[qsa_mask ? 1 : 2]);
+        std::vector<uint8_t> data(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+
+        capture->selected = 0;
+        for (int64_t j = 0; j < tensor->ne[qsa_mask ? 0 : 1]; ++j) {
+            const size_t offset = qsa_mask
+                ? j*tensor->nb[0] + capture->query*tensor->nb[1]
+                : j*tensor->nb[1] + capture->query*tensor->nb[2];
+            capture->selected += std::isfinite(qwen4exp_qsa_get_f32(tensor, data, offset));
+        }
+    }
+
+    return true;
+}
+
+static std::vector<int32_t> get_qwen4exp_qsa_block_pos() {
+    constexpr size_t seed = 3321213324;
+    constexpr int32_t n_tokens = 8;
+    constexpr int32_t n_pos = 4;
+
+    qwen4exp_qsa_capture capture;
+    capture.n_blocks = 64;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture);
+
+    const int32_t n_embd = llama_model_n_embd(model_and_ctx.first.get());
+    std::vector<float> embd(n_tokens*n_embd, 0.0f);
+    std::vector<llama_pos> pos(n_tokens*n_pos);
+    std::vector<int32_t> n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id> seq_data(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int8_t> logits(n_tokens, false);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        pos[              i] = i < 4 ? 0 : 5;
+        pos[  n_tokens + i] = i < 4 ? 0 : 1;
+        pos[2*n_tokens + i] = i % 4;
+        pos[3*n_tokens + i] = 0;
+        seq_id[i] = &seq_data[i];
+    }
+    logits.back() = true;
+
+    llama_batch batch = {
+        n_tokens,
+        nullptr,
+        embd.data(),
+        pos.data(),
+        n_seq_id.data(),
+        seq_id.data(),
+        logits.data(),
+    };
+    GGML_ASSERT(llama_decode(model_and_ctx.second.get(), batch) == 0);
+    return capture.block_pos;
+}
+
+static int64_t get_qwen4exp_qsa_selected_count() {
+    constexpr size_t seed = 3321213324;
+    constexpr uint32_t n_tokens = 14;
+
+    qwen4exp_qsa_capture capture;
+    capture.query = n_tokens - 1;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(n_tokens, 128, seed));
+    return capture.selected;
+}
+
+static void test_qwen4exp_qsa_block_semantics() {
+    const std::vector<int32_t> block_pos = get_qwen4exp_qsa_block_pos();
+    const int64_t selected = get_qwen4exp_qsa_selected_count();
+    const int64_t n_blocks = 64;
+
+    const bool positions_ok = block_pos.size() == 4*n_blocks &&
+        block_pos[0] == 0 && block_pos[1] == 5 &&
+        block_pos[n_blocks] == 0 && block_pos[n_blocks + 1] == 1 &&
+        block_pos[2*n_blocks] == 0 && block_pos[2*n_blocks + 1] == 0 &&
+        block_pos[3*n_blocks] == 0 && block_pos[3*n_blocks + 1] == 0;
+
+    if (!positions_ok || selected != 10) {
+        fprintf(stderr, "Qwen4Exp QSA regression: block positions %s, selected=%" PRId64 "\n",
+                positions_ok ? "OK" : "incorrect", selected);
+    }
+    GGML_ASSERT(positions_ok);
+    GGML_ASSERT(selected == 10);
 }
 
 static void test_qwen4exp_ple_shared_prefix() {
@@ -794,6 +930,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_indexer_seq_cp();
         test_qwen4exp_qsa_unified_sequences();
         test_qwen4exp_qsa_non_causal();
+        test_qwen4exp_qsa_block_semantics();
     }
 
     struct user_data_t {

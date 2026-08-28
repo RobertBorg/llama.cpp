@@ -345,11 +345,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
-        ggml_tensor * bias,
+        ggml_tensor * blk_bias,
+        ggml_tensor * tail_cells,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool causal_attn,
-        bool blk_bias) const {
+        bool causal_attn) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
@@ -361,29 +361,22 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_tps    = ubatch->n_seq_tokens;
     const int64_t r        = ratio;
+    const int64_t tail_cap = std::max<int64_t>(1, r - 1);
 
     GGML_ASSERT(ubatch->equal_seqs());
     GGML_ASSERT(n_lane == ubatch->n_seqs);
     GGML_ASSERT(n_tokens == n_tps*n_lane);
+    GGML_ASSERT(blk_cells->ne[0] == r*n_blocks && blk_cells->ne[1] == n_lane);
+    GGML_ASSERT(blk_bias->ne[0] == n_blocks && blk_bias->ne[1] == n_tps && blk_bias->ne[2] == n_lane);
+    GGML_ASSERT(tail_cells->ne[0] == tail_cap && tail_cells->ne[1] == n_tps && tail_cells->ne[2] == n_lane);
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_blk_bias  = (float   *) blk_bias->data;
+    int32_t * dst_tail      = (int32_t *) tail_cells->data;
 
-    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
-    // all mrope sections carry it: exact for text, approximate for images
-    for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_lane; ++s) {
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_lane) + s*n_blocks + b] = (int32_t) (b*r);
-            }
-        }
-    }
-
-    // one pass per lane: unified cache cells can belong to different sequences
-    std::vector<int32_t> blk_of(n_kv);
-    std::vector<int32_t> filled(n_blocks);
+    std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_lane, 0);
 
     for (int64_t s = 0; s < n_lane; ++s) {
         const llama_seq_id seq_of_lane = ubatch->seq_id[s*n_tps][0];
@@ -391,79 +384,88 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
-
-        // an incomplete block cannot be pooled; the bias below forces those tail cells in
-        // -1 means no usable block, and block 0 only keeps the gather in range
-        std::fill(blk_of.begin(),  blk_of.end(),  -1);
-        std::fill(filled.begin(),  filled.end(),   0);
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
-
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
-        bool oor = false;
+        std::vector<uint32_t> ordered;
+        ordered.reserve(n_kv);
 
         for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j) || !cells.seq_has(j, seq_of_lane)) {
-                continue;
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_of_lane)) {
+                ordered.push_back((uint32_t) j);
             }
-
-            const llama_pos p = cells.pos_get(j);
-            const int64_t   b = p/r;
-
-            if (b >= n_blocks) {
-                oor = true;
-                continue;
-            }
-
-            blk_of[j] = (int32_t) b;
-            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
-            filled[b]++;
         }
 
-        GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
-
-        // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
-        // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+        std::sort(ordered.begin(), ordered.end(), [&](uint32_t a, uint32_t b) {
+            const llama_pos pa = cells.pos_get(a);
+            const llama_pos pb = cells.pos_get(b);
+            if (pa != pb) {
+                return pa < pb;
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+
+            const auto & ea = cells.ext_get(a);
+            const auto & eb = cells.ext_get(b);
+            if (ea.y != eb.y) {
+                return ea.y < eb.y;
+            }
+            if (ea.x != eb.x) {
+                return ea.x < eb.x;
+            }
+            return a < b;
+        });
+
+        const int32_t safe_cell = ordered.empty() ? 0 : (int32_t) ordered[0];
+        std::fill(cur_cell_blk, cur_cell_blk + n_kv, (int32_t) n_blocks);
+        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, safe_cell);
+
+        const int64_t n_complete = ordered.size()/r;
+        GGML_ASSERT(n_complete <= n_blocks);
+
+        for (int64_t rank = 0; rank < n_complete*r; ++rank) {
+            const uint32_t cell = ordered[rank];
+            const int64_t b = rank/r;
+            const int64_t member = rank % r;
+
+            cur_cell_blk[cell] = (int32_t) b;
+            cur_blk_cells[b*r + member] = (int32_t) cell;
+
+            if (member == 0) {
+                const auto & ext = cells.ext_get(cell);
+                dst_blk_pos[                         s*n_blocks + b] = cells.pos_get(cell);
+                dst_blk_pos[  n_blocks*n_lane      + s*n_blocks + b] = ext.y;
+                dst_blk_pos[2*n_blocks*n_lane      + s*n_blocks + b] = ext.x;
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
-            const int64_t      i      = s*n_tps + ii;
-            const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const llama_pos    q      = ubatch->pos[i];
+            const int64_t i = s*n_tps + ii;
+            const llama_pos qt = ubatch->pos[i];
+            const llama_pos qy = ubatch->is_pos_2d() ? ubatch->pos[n_tokens + i] : 0;
+            const llama_pos qx = ubatch->is_pos_2d() ? ubatch->pos[2*n_tokens + i] : 0;
+            int64_t n_visible = ordered.size();
 
-            // the tail is an incomplete block and is always visible, as in the reference
-            const llama_pos visible_max = causal_attn ? q : cells.seq_pos_max(seq_id);
-            const llama_pos tail_start  = (visible_max + 1)/r*r;
-
-            if (blk_bias) {
-                // a block sits wholly inside or outside the tail, so one value covers it
-                // the caller adds the attention mask, which drops empty, foreign and future cells
-                float * cur_blk_bias = dst_bias + i*n_blocks;
-
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+            if (causal_attn) {
+                n_visible = 0;
+                for (uint32_t cell : ordered) {
+                    const llama_pos t = cells.pos_get(cell);
+                    const auto & ext = cells.ext_get(cell);
+                    if (t > qt || (t == qt && (ext.y > qy || (ext.y == qy && ext.x > qx)))) {
+                        break;
+                    }
+                    ++n_visible;
                 }
-
-                continue;
             }
 
-            float * cur_bias = dst_bias + i*n_kv;
+            float * cur_bias = dst_blk_bias + i*n_blocks;
+            const int64_t n_visible_blocks = n_visible/r;
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                cur_bias[b] = b < n_visible_blocks ? 0.0f : -INFINITY;
+            }
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float v = -INFINITY;
-
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && (!causal_attn || cells.pos_get(j) <= q)) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
-                }
-
-                cur_bias[j] = v;
+            int32_t * cur_tail = dst_tail + i*tail_cap;
+            for (int64_t j = 0; j < tail_cap; ++j) {
+                cur_tail[j] = (int32_t) (n_kv + j);
+            }
+            const int64_t n_tail = n_visible % r;
+            for (int64_t j = 0; j < n_tail; ++j) {
+                cur_tail[j] = (int32_t) ordered[n_visible - n_tail + j];
             }
         }
     }
