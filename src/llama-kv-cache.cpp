@@ -1856,6 +1856,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
 
     // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
     std::unordered_map<uint64_t, llama_token> hist;
+    std::unordered_map<uint64_t, uint32_t> hist_count;
 
     const auto key = [](llama_seq_id seq_id, llama_pos pos) {
         return ((uint64_t) seq_id << 32) | (uint32_t) pos;
@@ -1872,6 +1873,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
             [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
                 if (pos >= w0) {
                     hist[key(seq_id, pos)] = tok;
+                    hist_count[key(seq_id, pos)]++;
                 } else if (pos > below[seq_id].first) {
                     below[seq_id] = { pos, tok };
                 }
@@ -1903,6 +1905,17 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         }
     }
 
+    std::unordered_map<llama_seq_id, uint32_t> same_pos_before;
+    for (const auto & [seq_id, v] : seq_idx) {
+        const llama_pos p = ubatch.pos[v[0]];
+        uint32_t n_cur = 0;
+        for (uint32_t i : v) {
+            n_cur += ubatch.pos[i] == p;
+        }
+        const uint32_t n_all = hist_count[key(seq_id, p)];
+        same_pos_before[seq_id] = n_all > n_cur ? n_all - n_cur : 0;
+    }
+
     for (uint32_t i = 0; i < n_tokens; ++i) {
         // shared-prefix tokens have the same history; tokens shared after divergent histories are ambiguous
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
@@ -1915,7 +1928,12 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 const auto & v = seq_idx[seq_id];
                 const int64_t k = (int64_t) ord[i] - d;
                 // k >= 0: an earlier token of this very ubatch; k < 0: before the chunk
-                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+                if (k >= 0) {
+                    p = ubatch.pos[v[k]];
+                } else {
+                    const uint32_t n_same = same_pos_before[seq_id];
+                    p = ubatch.pos[v[0]] + (llama_pos) std::min<int64_t>(0, k + n_same);
+                }
             } else {
                 p = ubatch.pos[i] - d;
             }

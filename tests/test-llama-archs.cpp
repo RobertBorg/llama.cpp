@@ -760,6 +760,81 @@ static void test_qwen4exp_qsa_pool_precision() {
     GGML_ASSERT(changed > 0);
 }
 
+struct qwen4exp_ple_capture {
+    std::vector<int32_t> rows;
+};
+
+static bool qwen4exp_ple_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const bool ple_embd = strncmp(tensor->name, "ple_embd-", strlen("ple_embd-")) == 0;
+    if (ask) {
+        return ple_embd;
+    }
+
+    if (ple_embd) {
+        auto * capture = static_cast<qwen4exp_ple_capture *>(user_data);
+        const ggml_tensor * gather = tensor;
+        while (gather != nullptr && gather->op != GGML_OP_GET_ROWS) {
+            gather = gather->src[0];
+        }
+        GGML_ASSERT(gather != nullptr);
+        const ggml_tensor * rows = gather->src[1];
+        GGML_ASSERT(rows != nullptr && rows->type == GGML_TYPE_I32);
+        capture->rows.resize(ggml_nelements(rows));
+        ggml_backend_tensor_get(rows, capture->rows.data(), 0, ggml_nbytes(rows));
+    }
+
+    return true;
+}
+
+static void decode_qwen4exp_image_chunk(llama_context * lctx, int32_t x0, int32_t n_tokens) {
+    const int32_t n_embd = llama_model_n_embd(llama_get_model(lctx));
+    std::vector<float> embd(n_tokens*n_embd, 0.0f);
+    std::vector<llama_pos> pos(4*n_tokens, 0);
+    std::vector<int32_t> n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id> seq_data(n_tokens, 0);
+    std::vector<llama_seq_id *> seq_id(n_tokens);
+    std::vector<int8_t> logits(n_tokens, false);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        pos[2*n_tokens + i] = x0 + i;
+        seq_id[i] = &seq_data[i];
+    }
+    logits.back() = true;
+
+    llama_batch batch = {
+        n_tokens,
+        nullptr,
+        embd.data(),
+        pos.data(),
+        n_seq_id.data(),
+        seq_id.data(),
+        logits.data(),
+    };
+    GGML_ASSERT(llama_decode(lctx, batch) == 0);
+}
+
+static void test_qwen4exp_ple_split_mrope_history() {
+    constexpr size_t seed = 3321213324;
+
+    qwen4exp_ple_capture capture;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_ple_capture_cb, &capture);
+
+    decode_qwen4exp_image_chunk(model_and_ctx.second.get(), 0, 65);
+
+    const int32_t hash = (qwen4exp_ple_image_token_id ^ 2*qwen4exp_ple_image_token_id) % 8;
+    const std::vector<int32_t> expected = { hash, hash + 8, hash + 16, hash + 24 };
+    if (capture.rows != expected) {
+        fprintf(stderr, "Qwen4Exp PLE regression: split image rows");
+        for (const int32_t row : capture.rows) {
+            fprintf(stderr, " %d", row);
+        }
+        fprintf(stderr, "\n");
+    }
+    GGML_ASSERT(capture.rows == expected);
+}
+
 static void test_qwen4exp_ple_shared_prefix() {
     constexpr size_t seed = 3321213324;
 
@@ -981,6 +1056,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
         test_qwen4exp_ple_metadata_save();
+        test_qwen4exp_ple_split_mrope_history();
         test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
         test_qwen4exp_qsa_unified_sequences();
