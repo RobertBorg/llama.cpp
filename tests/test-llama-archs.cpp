@@ -576,6 +576,7 @@ struct qwen4exp_qsa_capture {
     int64_t n_blocks = 0;
     int64_t query = -1;
     int64_t selected = -1;
+    int64_t pooled_norm_shape[4] = {};
     std::vector<int32_t> block_pos;
     ggml_type pooled_type = GGML_TYPE_COUNT;
     std::vector<float> pooled_keys;
@@ -598,6 +599,16 @@ static float qwen4exp_qsa_get_f32(const ggml_tensor * tensor, const std::vector<
 static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
     auto * capture = static_cast<qwen4exp_qsa_capture *>(user_data);
 
+    const ggml_tensor * norm_src = tensor->src[0];
+    bool pooled_norm = capture->pooled_norm_shape[0] == 0 && tensor->op == GGML_OP_RMS_NORM;
+    for (int depth = 0; pooled_norm && norm_src != nullptr && depth < 4; ++depth, norm_src = norm_src->src[0]) {
+        if (strncmp(norm_src->name, "indexer_k_pooled-", strlen("indexer_k_pooled-")) == 0) {
+            break;
+        }
+    }
+    pooled_norm &= norm_src != nullptr &&
+        strncmp(norm_src->name, "indexer_k_pooled-", strlen("indexer_k_pooled-")) == 0;
+
     const bool block_pos = capture->block_pos.empty() && capture->n_blocks > 0 &&
         tensor->op == GGML_OP_ROPE && tensor->src[1] != nullptr &&
         ggml_nelements(tensor->src[1]) == 4*capture->n_blocks && tensor->ne[2] == capture->n_blocks;
@@ -610,7 +621,11 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
         strncmp(tensor->name, "indexer_k_pooled-", strlen("indexer_k_pooled-")) == 0;
 
     if (ask) {
-        return block_pos || old_selection || qsa_mask || pooled_keys;
+        return pooled_norm || block_pos || old_selection || qsa_mask || pooled_keys;
+    }
+
+    if (pooled_norm) {
+        memcpy(capture->pooled_norm_shape, tensor->ne, sizeof(capture->pooled_norm_shape));
     }
 
     if (block_pos) {
@@ -650,6 +665,30 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
     }
 
     return true;
+}
+
+static void test_qwen4exp_qsa_norm_layout() {
+    constexpr size_t seed = 3321213324;
+    constexpr uint32_t n_tokens = 4;
+
+    qwen4exp_qsa_capture capture;
+    capture.n_blocks = 64;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2, true,
+            qwen4exp_qsa_capture_cb, &capture);
+
+    const std::vector<llama_token> target = get_tokens(n_tokens, 128, seed);
+    const std::vector<llama_token> companion = get_tokens(n_tokens, 128, seed + 1);
+    get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion, 0);
+
+    if (capture.pooled_norm_shape[1] != capture.n_blocks || capture.pooled_norm_shape[2] != 2) {
+        fprintf(stderr, "Qwen4Exp QSA regression: pooled key norm shape is [%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "]\n",
+                capture.pooled_norm_shape[0], capture.pooled_norm_shape[1],
+                capture.pooled_norm_shape[2], capture.pooled_norm_shape[3]);
+    }
+    GGML_ASSERT(capture.pooled_norm_shape[1] == capture.n_blocks);
+    GGML_ASSERT(capture.pooled_norm_shape[2] == 2);
 }
 
 static std::vector<int32_t> get_qwen4exp_qsa_block_pos() {
@@ -1061,6 +1100,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_indexer_seq_cp();
         test_qwen4exp_qsa_unified_sequences();
         test_qwen4exp_qsa_non_causal();
+        test_qwen4exp_qsa_norm_layout();
         test_qwen4exp_qsa_block_semantics();
         test_qwen4exp_qsa_pool_precision();
     }
