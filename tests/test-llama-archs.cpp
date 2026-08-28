@@ -1042,7 +1042,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, arch == LLM_ARCH_QWEN4EXP);
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
