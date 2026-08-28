@@ -355,13 +355,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
     const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
+    const int64_t n_lane   = cell_blk->ne[1];
+    const int64_t n_blocks = blk_pos->ne[0]/(4*n_lane);
     const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_tps    = ubatch->n_seq_tokens;
     const int64_t r        = ratio;
 
-    GGML_ASSERT(n_tokens % n_ns == 0);
-    const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+    GGML_ASSERT(ubatch->equal_seqs());
+    GGML_ASSERT(n_lane == ubatch->n_seqs);
+    GGML_ASSERT(n_tokens == n_tps*n_lane);
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
@@ -371,21 +373,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
     // all mrope sections carry it: exact for text, approximate for images
     for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_ns; ++s) {
+        for (int64_t s = 0; s < n_lane; ++s) {
             for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
+                dst_blk_pos[sec*(n_blocks*n_lane) + s*n_blocks + b] = (int32_t) (b*r);
             }
         }
     }
 
-    // one pass per stream: cell j is a different token in each, so no mapping is shared
+    // one pass per lane: unified cache cells can belong to different sequences
     std::vector<int32_t> blk_of(n_kv);
     std::vector<int32_t> filled(n_blocks);
 
-    for (int64_t s = 0; s < n_ns; ++s) {
-        // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
-        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
+    for (int64_t s = 0; s < n_lane; ++s) {
+        const llama_seq_id seq_of_lane = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = mem->get_mem_idx()->get_cells(seq_of_lane);
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -401,7 +402,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool oor = false;
 
         for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j)) {
+            if (cells.is_empty(j) || !cells.seq_has(j, seq_of_lane)) {
                 continue;
             }
 

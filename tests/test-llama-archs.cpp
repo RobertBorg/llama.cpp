@@ -475,6 +475,67 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+static std::vector<float> get_qwen4exp_unified_logits(
+        llama_model * model, llama_context * lctx,
+        const std::vector<llama_token> & target,
+        const std::vector<llama_token> & companion,
+        llama_seq_id target_seq) {
+    GGML_ASSERT(target.size() == companion.size());
+    GGML_ASSERT(target_seq == 0 || target_seq == 1);
+
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = target.size();
+    llama_batch batch = llama_batch_init(2*n_tokens, 0, 1);
+    batch.n_tokens = 0;
+
+    for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+        const auto & tokens = seq_id == target_seq ? target : companion;
+        for (uint32_t pos = 0; pos < n_tokens; ++pos) {
+            const int32_t i = batch.n_tokens++;
+            batch.token[i] = tokens[pos];
+            batch.pos[i] = pos;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = seq_id;
+            batch.logits[i] = seq_id == target_seq && pos + 1 == n_tokens;
+        }
+    }
+
+    if (llama_decode(lctx, batch)) {
+        llama_batch_free(batch);
+        throw std::runtime_error("failed to decode unified QSA batch");
+    }
+
+    const int32_t output_idx = target_seq*n_tokens + n_tokens - 1;
+    const float * logits = llama_get_logits_ith(lctx, output_idx);
+    GGML_ASSERT(logits != nullptr);
+    std::vector<float> result(logits, logits + n_vocab);
+
+    llama_batch_free(batch);
+    llama_memory_clear(llama_get_memory(lctx), true);
+    return result;
+}
+
+static void test_qwen4exp_qsa_unified_sequences() {
+    constexpr size_t   seed     = 3321213324;
+    constexpr uint32_t n_prompt = 32;
+    constexpr uint32_t n_vocab  = 128;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2, true);
+
+    const std::vector<llama_token> target      = get_tokens(n_prompt, n_vocab, seed);
+    const std::vector<llama_token> companion_a = get_tokens(n_prompt, n_vocab, seed + 1);
+    const std::vector<llama_token> companion_b = get_tokens(n_prompt, n_vocab, seed + 2);
+
+    const auto seq0_a = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_a, 0);
+    const auto seq0_b = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_b, 0);
+    GGML_ASSERT(seq0_a == seq0_b);
+
+    const auto seq1_a = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_a, 1);
+    const auto seq1_b = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_b, 1);
+    GGML_ASSERT(seq1_a == seq1_b);
+}
+
 static void test_qwen4exp_ple_shared_prefix() {
     constexpr size_t seed = 3321213324;
 
@@ -698,6 +759,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_ple_metadata_save();
         test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
+        test_qwen4exp_qsa_unified_sequences();
     }
 
     struct user_data_t {
