@@ -34,6 +34,23 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        self._ple_weight_scale: float | None = None
+
+    def dequant_model(self):
+        scale_names = [
+            name for name in self.model_tensors
+            if name.endswith("ple_embedding.ngram_embedding.weight_scale")
+        ]
+        if len(scale_names) > 1:
+            raise ValueError(f"got multiple PLE n-gram weight scales: {scale_names}")
+        if scale_names:
+            from .base import LazyTorchTensor
+
+            scale = LazyTorchTensor.to_eager(self.model_tensors.pop(scale_names[0])()).float()
+            if scale.numel() != 1:
+                raise ValueError(f"PLE n-gram weight scale must be scalar, got shape {tuple(scale.shape)}")
+            self._ple_weight_scale = float(scale.item())
+        super().dequant_model()
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -177,7 +194,12 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
             # a fresh lazy tensor every call, or to_eager() memoizes every shard
             eager = LazyTorchTensor.to_eager(self.model_tensors[name]())
-            return eager.to(torch.float32).contiguous().numpy()
+            chunk = eager.to(torch.float32)
+            if eager.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                if self._ple_weight_scale is None:
+                    raise ValueError("PLE n-gram table is FP8 but its weight scale is missing")
+                chunk.mul_(self._ple_weight_scale)
+            return chunk.contiguous().numpy()
         return load
 
     def prepare_tensors(self):
