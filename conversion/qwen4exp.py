@@ -37,6 +37,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_weight_scale: float | None = None
 
     def dequant_model(self):
+        ple_shard_names = [
+            name for name in self.model_tensors
+            if ".ngram_embedding.shard_" in name
+        ]
+        if (
+            self._fp8_as_q8
+            and ple_shard_names
+            and all(self.model_tensors[name]().dtype in (torch.float8_e4m3fn, torch.float8_e5m2) for name in ple_shard_names)
+        ):
+            self._fp8_dequantized.update(ple_shard_names)
+
         scale_names = [
             name for name in self.model_tensors
             if name.endswith("ple_embedding.ngram_embedding.weight_scale")
