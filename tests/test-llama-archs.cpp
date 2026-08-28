@@ -536,6 +536,30 @@ static void test_qwen4exp_qsa_unified_sequences() {
     GGML_ASSERT(seq1_a == seq1_b);
 }
 
+static void test_qwen4exp_qsa_non_causal() {
+    constexpr size_t   seed     = 3321213324;
+    constexpr uint32_t n_prompt = 17;
+    constexpr uint32_t n_vocab  = 128;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    llama_set_causal_attn(model_and_ctx.second.get(), false);
+
+    std::vector<llama_token> prompt_a = get_tokens(n_prompt, n_vocab, seed);
+    std::vector<llama_token> prompt_b = prompt_a;
+    prompt_b.back() = (prompt_b.back() + 1) % n_vocab;
+
+    const std::vector<float> logits_a = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), prompt_a);
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    const std::vector<float> logits_b = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), prompt_b);
+
+    bool changed = false;
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        changed |= logits_a[i] != logits_b[i];
+    }
+    GGML_ASSERT(changed);
+}
+
 static void test_qwen4exp_ple_shared_prefix() {
     constexpr size_t seed = 3321213324;
 
@@ -760,6 +784,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
         test_qwen4exp_qsa_unified_sequences();
+        test_qwen4exp_qsa_non_causal();
     }
 
     struct user_data_t {

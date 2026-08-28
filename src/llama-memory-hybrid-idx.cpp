@@ -348,6 +348,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
+        bool causal_attn,
         bool blk_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
@@ -436,7 +437,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const llama_pos    q      = ubatch->pos[i];
 
             // the tail is an incomplete block and is always visible, as in the reference
-            const llama_pos tail_start = (q + 1)/r*r;
+            const llama_pos visible_max = causal_attn ? q : cells.seq_pos_max(seq_id);
+            const llama_pos tail_start  = (visible_max + 1)/r*r;
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
@@ -456,7 +458,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             for (int64_t j = 0; j < n_kv; ++j) {
                 float v = -INFINITY;
 
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && (!causal_attn || cells.pos_get(j) <= q)) {
                     // finite, so it can never meet a -inf and produce a nan
                     v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
                 }
