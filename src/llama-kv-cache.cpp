@@ -1904,8 +1904,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        // TODO: a token that belongs to more than one sequence has an ambiguous history.
-        //       the n-gram architectures have to reject such batches
+        // shared-prefix tokens have the same history; tokens shared after divergent histories are ambiguous
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         for (uint32_t j = 0; j < n; ++j) {

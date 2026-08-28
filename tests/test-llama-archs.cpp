@@ -406,7 +406,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1,
+        bool kv_unified = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -418,6 +419,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
     ctx_params.n_seq_max = n_seq_max;
+    ctx_params.kv_unified = kv_unified;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -473,12 +475,19 @@ static std::vector<float> get_logits(
     return ret;
 }
 
-static void test_qwen4exp_ple_model_init() {
+static void test_qwen4exp_ple_shared_prefix() {
     constexpr size_t seed = 3321213324;
 
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
-    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
-    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(4, 128, seed));
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2, true);
+    const std::vector<llama_token> tokens = get_tokens(4, 128, seed);
+
+    llama_batch batch = llama_batch_init(tokens.size(), 0, 2);
+    for (uint32_t pos = 0; pos < tokens.size(); ++pos) {
+        common_batch_add(batch, tokens[pos], pos, {0, 1}, pos + 1 == tokens.size());
+    }
+    GGML_ASSERT(llama_decode(model_and_ctx.second.get(), batch) == 0);
+    llama_batch_free(batch);
 }
 
 static void test_qwen4exp_indexer_seq_cp() {
@@ -687,7 +696,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
         test_qwen4exp_ple_metadata_save();
-        test_qwen4exp_ple_model_init();
+        test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
     }
 

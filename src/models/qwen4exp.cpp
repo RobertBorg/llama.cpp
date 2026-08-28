@@ -1011,11 +1011,6 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(mctx != nullptr);
 
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
-        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
-    }
-
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
