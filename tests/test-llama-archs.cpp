@@ -577,6 +577,9 @@ struct qwen4exp_qsa_capture {
     int64_t query = -1;
     int64_t selected = -1;
     std::vector<int32_t> block_pos;
+    ggml_type pooled_type = GGML_TYPE_COUNT;
+    std::vector<float> pooled_keys;
+    std::vector<float> pooled_keys_f32;
 };
 
 static float qwen4exp_qsa_get_f32(const ggml_tensor * tensor, const std::vector<uint8_t> & data, size_t offset) {
@@ -603,9 +606,11 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
         strncmp(tensor->src[1]->name, "indexer_top_k-", strlen("indexer_top_k-")) == 0;
     const bool qsa_mask = capture->selected < 0 && capture->query >= 0 &&
         strncmp(tensor->name, "qsa_mask-", strlen("qsa_mask-")) == 0;
+    const bool pooled_keys = capture->pooled_keys.empty() &&
+        strncmp(tensor->name, "indexer_k_pooled-", strlen("indexer_k_pooled-")) == 0;
 
     if (ask) {
-        return block_pos || old_selection || qsa_mask;
+        return block_pos || old_selection || qsa_mask || pooled_keys;
     }
 
     if (block_pos) {
@@ -624,6 +629,23 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
                 ? j*tensor->nb[0] + capture->query*tensor->nb[1]
                 : j*tensor->nb[1] + capture->query*tensor->nb[2];
             capture->selected += std::isfinite(qwen4exp_qsa_get_f32(tensor, data, offset));
+        }
+    }
+
+    if (pooled_keys) {
+        std::vector<uint8_t> data(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+
+        capture->pooled_type = tensor->type;
+        capture->pooled_keys.resize(ggml_nelements(tensor));
+        for (int64_t i = 0; i < ggml_nelements(tensor); ++i) {
+            capture->pooled_keys[i] = qwen4exp_qsa_get_f32(tensor, data, i*tensor->nb[0]);
+        }
+
+        const ggml_tensor * src = tensor->src[0];
+        if (src != nullptr && src->type == GGML_TYPE_F32 && ggml_nelements(src) == ggml_nelements(tensor)) {
+            capture->pooled_keys_f32.resize(ggml_nelements(src));
+            ggml_backend_tensor_get(src, capture->pooled_keys_f32.data(), 0, ggml_nbytes(src));
         }
     }
 
@@ -703,6 +725,39 @@ static void test_qwen4exp_qsa_block_semantics() {
     }
     GGML_ASSERT(positions_ok);
     GGML_ASSERT(selected == 10);
+}
+
+static void test_qwen4exp_qsa_pool_precision() {
+    constexpr size_t seed = 3321213324;
+    constexpr uint32_t n_tokens = 14;
+
+    qwen4exp_qsa_capture capture;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(n_tokens, 128, seed));
+
+    GGML_ASSERT(!capture.pooled_keys.empty());
+    int64_t unrounded = 0;
+    for (const float value : capture.pooled_keys) {
+        GGML_ASSERT(std::isfinite(value));
+        unrounded += value != ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+    }
+    if (capture.pooled_type != GGML_TYPE_F16 || unrounded != 0) {
+        fprintf(stderr, "Qwen4Exp QSA regression: pooled keys are %s with %" PRId64 " values outside FP16 precision\n",
+                ggml_type_name(capture.pooled_type), unrounded);
+    }
+    GGML_ASSERT(capture.pooled_type == GGML_TYPE_F16);
+    GGML_ASSERT(unrounded == 0);
+
+    GGML_ASSERT(capture.pooled_keys_f32.size() == capture.pooled_keys.size());
+    int64_t changed = 0;
+    for (size_t i = 0; i < capture.pooled_keys.size(); ++i) {
+        const float rounded = ggml_fp16_to_fp32(ggml_fp32_to_fp16(capture.pooled_keys_f32[i]));
+        GGML_ASSERT(capture.pooled_keys[i] == rounded);
+        changed += capture.pooled_keys_f32[i] != rounded;
+    }
+    GGML_ASSERT(changed > 0);
 }
 
 static void test_qwen4exp_ple_shared_prefix() {
@@ -931,6 +986,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_qsa_unified_sequences();
         test_qwen4exp_qsa_non_causal();
         test_qwen4exp_qsa_block_semantics();
+        test_qwen4exp_qsa_pool_precision();
     }
 
     struct user_data_t {

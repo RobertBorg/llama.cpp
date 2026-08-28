@@ -572,7 +572,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    cb(pooled, "indexer_k_pooled", il);
+
+    // get_rows returns F32; the reference casts the F32 mean back to the raw-key dtype
+    const ggml_type k_type = mctx_idx->type_k();
+    if (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_BF16) {
+        pooled = ggml_cast(ctx0, pooled, k_type);
+        cb(pooled, "indexer_k_pooled", il);
+        pooled = ggml_cast(ctx0, pooled, GGML_TYPE_F32);
+    } else {
+        cb(pooled, "indexer_k_pooled", il);
+    }
 
     // rope wants [n_dims, n_head, n_tokens]: lay every lane's blocks flat, split after.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_lane);
