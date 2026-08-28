@@ -127,8 +127,16 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
+        int64_t ple_rows;
+        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+            ple_rows = ple_w->tensor->ne[1];
+        } else {
+            const int64_t ple_id = gguf_find_tensor(ml.metadata, ple_name.c_str());
+            if (ple_id < 0) {
+                throw std::runtime_error(format("%s: tensor '%s' not found", __func__, ple_name.c_str()));
+            }
+            ple_rows = gguf_get_tensor_ne(ml.metadata, ple_id)[1];
+        }
 
         // sanity check
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {

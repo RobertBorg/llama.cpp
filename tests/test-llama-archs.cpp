@@ -109,10 +109,12 @@ static void test_qwen4exp_ple_metadata_save() {
     GGML_ASSERT(gguf_get_val_u32(saver.gguf_ctx, key_id) == qwen4exp_ple_image_token_id);
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool ple = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
+
+    GGML_ASSERT(!ple || arch == LLM_ARCH_QWEN4EXP);
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -284,6 +286,33 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        if (ple) {
+            ms.add_kv(LLM_KV_PLE_LAYERS,            std::vector<uint32_t>{0});
+            ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,        uint32_t(2));
+            ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,   uint32_t(4));
+            ms.add_kv(LLM_KV_PLE_CONV_KERNEL,       uint32_t(2));
+            ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS, std::vector<uint64_t>{1, 2});
+            ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,      std::vector<uint64_t>{0, 8, 16, 24});
+            ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,  std::vector<uint64_t>{8, 8, 8, 8});
+            ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,      uint32_t(127));
+            ms.add_kv(LLM_KV_PLE_IMAGE_TOKEN_ID,    qwen4exp_ple_image_token_id);
+            ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, uint32_t(64));
+
+            ggml_tensor t = {};
+            t.type  = GGML_TYPE_F16;
+            t.ne[0] = 64;
+            t.ne[1] = 32;
+            t.ne[2] = 1;
+            t.ne[3] = 1;
+            t.nb[0] = ggml_type_size(t.type);
+            t.nb[1] = ggml_row_size(t.type, t.ne[0]);
+            t.nb[2] = t.nb[1] * t.ne[1];
+            t.nb[3] = t.nb[2] * t.ne[2];
+            const std::string name = LLM_TN(arch)(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+            ggml_set_name(&t, name.c_str());
+            gguf_add_tensor(ms.gguf_ctx, &t);
+        }
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
@@ -442,6 +471,14 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_qwen4exp_ple_model_init() {
+    constexpr size_t seed = 3321213324;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(4, 128, seed));
 }
 
 static void test_qwen4exp_indexer_seq_cp() {
@@ -650,6 +687,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
         test_qwen4exp_ple_metadata_save();
+        test_qwen4exp_ple_model_init();
         test_qwen4exp_indexer_seq_cp();
     }
 
