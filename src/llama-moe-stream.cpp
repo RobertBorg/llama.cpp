@@ -487,22 +487,33 @@ static void llama_moe_stream_remap_impl(
         llama_moe_stream_layer * layer,
         ggml_tensor * dst,
         const ggml_tensor * src,
-        uint32_t expert_first,
-        uint32_t expert_last,
-        int32_t sentinel,
-        bool first_wave,
-        bool last_wave) {
+        const llama_moe_stream_wave * wave) {
     auto * mgr = layer->mgr;
     GGML_ASSERT(src->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src));
     GGML_ASSERT(ggml_are_same_shape(src, dst));
-    GGML_ASSERT(expert_first < expert_last && expert_last <= layer->n_expert);
 
     const int64_t count = ggml_nelements(src);
     const int32_t * ids = (const int32_t *) src->data;
     int32_t * slots = (int32_t *) dst->data;
 
     std::unique_lock<std::mutex> lock(mgr->mtx);
+    uint32_t expert_first = 0;
+    uint32_t expert_last = layer->n_expert;
+    int32_t sentinel = -1;
+    bool first_wave = true;
+    bool last_wave = true;
+    if (wave) {
+        GGML_ASSERT(wave->layer == layer && wave->count == layer->waves.size() && wave->index < wave->count);
+        const uint32_t index = layer->wave_reverse ? wave->count - 1 - wave->index : wave->index;
+        expert_first = layer->waves[index].expert_first;
+        expert_last = layer->waves[index].expert_last;
+        sentinel = layer->n_slots;
+        first_wave = wave->index == 0;
+        last_wave = wave->index + 1 == wave->count;
+    }
+    GGML_ASSERT(expert_first < expert_last && expert_last <= layer->n_expert);
+
     if (mgr->load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed");
     }
@@ -542,6 +553,12 @@ static void llama_moe_stream_remap_impl(
     }
 
     std::fill(layer->keep.begin(), layer->keep.end(), 0);
+    for (const int32_t expert : layer->uniq) {
+        const auto found = layer->expert_slot.find(expert);
+        if (found != layer->expert_slot.end()) {
+            layer->keep[found->second] = 1;
+        }
+    }
     layer->demand_slots.clear();
     bool waited = false;
     for (const int32_t expert : layer->uniq) {
@@ -608,6 +625,9 @@ static void llama_moe_stream_remap_impl(
         layer->slot_last_use[slot] = ++layer->use_counter;
         slots[i] = slot;
     }
+    if (wave && last_wave) {
+        layer->wave_reverse = !layer->wave_reverse;
+    }
 }
 
 void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void * userdata) {
@@ -617,7 +637,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * src, int ith,
     }
 
     auto * layer = (llama_moe_stream_layer *) userdata;
-    llama_moe_stream_remap_impl(layer, dst, src, 0, layer->n_expert, -1, true, true);
+    llama_moe_stream_remap_impl(layer, dst, src, nullptr);
 }
 
 void llama_moe_stream_remap_wave(
@@ -634,13 +654,5 @@ void llama_moe_stream_remap_wave(
     }
 
     auto * wave = (llama_moe_stream_wave *) userdata;
-    llama_moe_stream_remap_impl(
-            wave->layer,
-            dst,
-            src,
-            wave->expert_first,
-            wave->expert_last,
-            wave->layer->n_slots,
-            wave->index == 0,
-            wave->index + 1 == wave->count);
+    llama_moe_stream_remap_impl(wave->layer, dst, src, wave);
 }

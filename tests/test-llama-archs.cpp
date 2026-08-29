@@ -1052,8 +1052,100 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+static llama_moe_stream_layer * make_moe_stream_test_layer(
+        llama_moe_stream & stream,
+        uint32_t n_expert,
+        uint32_t n_slots) {
+    auto layer = std::make_unique<llama_moe_stream_layer>();
+    layer->mgr      = &stream;
+    layer->il       = 0;
+    layer->n_expert = n_expert;
+    layer->n_slots  = n_slots;
+    layer->slot_expert.resize(n_slots, -1);
+    layer->slot_state.resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
+    layer->slot_claimed.resize(n_slots, 0);
+    layer->slot_gen.resize(n_slots, 0);
+    layer->slot_last_use.resize(n_slots, 0);
+    layer->route_hotness.resize(n_expert, 0);
+    layer->seen.resize(n_expert, 0);
+    layer->keep.resize(n_slots, 0);
+
+    const uint32_t n_waves = (n_expert + n_slots - 1)/n_slots;
+    layer->waves.resize(n_waves);
+    for (uint32_t iw = 0; iw < n_waves; ++iw) {
+        layer->waves[iw] = {
+            layer.get(),
+            iw*n_slots,
+            std::min(n_expert, (iw + 1)*n_slots),
+            iw,
+            n_waves,
+        };
+    }
+
+    stream.layers[0] = std::move(layer);
+    return stream.layers[0].get();
+}
+
+static void test_moe_stream_cache_policy() {
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4096,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx != nullptr);
+
+    {
+        llama_moe_stream stream(1, 3, 1, false);
+        llama_moe_stream_layer * layer = make_moe_stream_test_layer(stream, 4, 3);
+        layer->slot_expert   = { 1, 2, 3 };
+        layer->slot_state    = { LLAMA_MOE_STREAM_SLOT_RESIDENT, LLAMA_MOE_STREAM_SLOT_RESIDENT, LLAMA_MOE_STREAM_SLOT_RESIDENT };
+        layer->slot_last_use = { 100, 1, 2 };
+        layer->route_hotness = { 0, 1, 0, 0 };
+        layer->expert_slot   = { { 1, 0 }, { 2, 1 }, { 3, 2 } };
+        layer->seen          = { 0, 1, 1, 1 };
+        layer->use_counter   = 100;
+
+        ggml_tensor * src = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3);
+        ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 3);
+        const int32_t ids[] = { 0, 2, 3 };
+        memcpy(src->data, ids, sizeof(ids));
+        llama_moe_stream_remap(dst, src, 0, 1, layer);
+
+        GGML_ASSERT(stream.stats.n_miss == 1);
+        GGML_ASSERT(stream.stats.n_hit == 2);
+        GGML_ASSERT(layer->expert_slot.count(1) == 0);
+        for (const int32_t expert : ids) {
+            GGML_ASSERT(layer->expert_slot.count(expert) == 1);
+        }
+    }
+
+    {
+        llama_moe_stream stream(1, 2, 1, false);
+        llama_moe_stream_layer * layer = make_moe_stream_test_layer(stream, 5, 2);
+        ggml_tensor * src = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 5);
+        ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 5);
+        const int32_t ids[] = { 0, 1, 2, 3, 4 };
+        memcpy(src->data, ids, sizeof(ids));
+
+        auto run_waves = [&]() {
+            for (auto & wave : layer->waves) {
+                llama_moe_stream_remap_wave(dst, src, dst, 0, 1, &wave);
+            }
+        };
+        run_waves();
+        GGML_ASSERT(stream.stats.n_miss == 5 && stream.stats.n_hit == 0);
+        run_waves();
+        GGML_ASSERT(stream.stats.n_miss == 8 && stream.stats.n_hit == 2);
+        run_waves();
+        GGML_ASSERT(stream.stats.n_miss == 11 && stream.stats.n_hit == 4);
+    }
+}
+
 static void test_qwen4exp_moe_stream_exact() {
     constexpr size_t seed = 3321213324;
+
+    test_moe_stream_cache_policy();
 
     for (const size_t alignment : { 1, 2, 512, 8192 }) {
         GGML_ASSERT(llama_moe_stream_alignment_supported(alignment));

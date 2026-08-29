@@ -69,6 +69,7 @@ struct llama_moe_stream_layer {
     std::vector<uint32_t> route_hotness;
     std::vector<uint8_t>  seen;
     int64_t use_counter = 0;
+    bool wave_reverse = false;
 
     std::vector<int32_t> uniq;
     std::vector<uint8_t>  touched;
