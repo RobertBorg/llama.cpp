@@ -4,7 +4,9 @@
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -19,6 +21,8 @@
 
 struct llama_moe_stream;
 struct llama_moe_stream_layer;
+
+static constexpr size_t LLAMA_MOE_STREAM_IO_BATCH = 4;
 
 struct llama_moe_stream_io_range {
     size_t offs = 0;
@@ -49,6 +53,12 @@ struct llama_moe_stream_wave {
     uint32_t count        = 0;
 };
 
+struct llama_moe_stream_work_item {
+    int32_t  expert = -1;
+    int32_t  slot   = -1;
+    uint64_t gen    = 0;
+};
+
 struct llama_moe_stream_layer {
     llama_moe_stream * mgr = nullptr;
 
@@ -61,7 +71,7 @@ struct llama_moe_stream_layer {
 
     std::vector<int32_t>                 slot_expert;
     std::vector<uint8_t>                 slot_state;
-    std::vector<uint8_t>                 slot_claimed;
+    std::vector<uint8_t>                 slot_pending;
     std::vector<uint64_t>                slot_gen;
     std::vector<int64_t>                 slot_last_use;
     std::unordered_map<int32_t, int32_t> expert_slot;
@@ -75,6 +85,8 @@ struct llama_moe_stream_layer {
     std::vector<uint8_t>  touched;
     std::vector<uint8_t>  keep;
     std::vector<int32_t> demand_slots;
+    std::vector<uint32_t> weight_order;
+    std::vector<llama_moe_stream_work_item> loads;
 
     bool matches(const ggml_tensor * gate, const ggml_tensor * up, const ggml_tensor * down, const ggml_tensor * gate_up) const;
 };
@@ -82,9 +94,9 @@ struct llama_moe_stream_layer {
 struct llama_moe_stream_work {
     llama_moe_stream_layer * sl = nullptr;
 
-    int32_t  expert = -1;
-    int32_t  slot   = -1;
-    uint64_t gen    = 0;
+    uint32_t weight = 0;
+    uint32_t count  = 0;
+    std::array<llama_moe_stream_work_item, LLAMA_MOE_STREAM_IO_BATCH> items;
 };
 
 struct llama_moe_stream {
@@ -139,11 +151,17 @@ struct llama_moe_stream {
     bool wave_supported  = false;
 
     struct {
-        int64_t n_calls     = 0;
-        int64_t n_hit       = 0;
-        int64_t n_miss      = 0;
-        int64_t n_miss_cold = 0;
-        int64_t t_stall_us  = 0;
+        int64_t n_calls         = 0;
+        int64_t n_hit           = 0;
+        int64_t n_miss          = 0;
+        int64_t n_miss_cold     = 0;
+        int64_t n_weight_slices = 0;
+        int64_t n_read_ops      = 0;
+        int64_t n_read_bytes    = 0;
+        int64_t n_upload_ops    = 0;
+        int64_t t_read_us       = 0;
+        int64_t t_upload_us     = 0;
+        int64_t t_stall_us      = 0;
     } stats;
 
     void start_workers_locked();

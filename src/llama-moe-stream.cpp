@@ -220,7 +220,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         layer->n_slots  = n_slots;
         layer->slot_expert.resize(n_slots, -1);
         layer->slot_state.resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
-        layer->slot_claimed.resize(n_slots, 0);
+        layer->slot_pending.resize(n_slots, 0);
         layer->slot_gen.resize(n_slots, 0);
         layer->slot_last_use.resize(n_slots, 0);
         layer->route_hotness.resize(n_expert, 0);
@@ -248,6 +248,20 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
 
 void llama_moe_stream::alloc_bufs(bool no_alloc) {
     wave_supported = !ctxs.empty();
+    for (auto & layer : layers) {
+        if (!layer) {
+            continue;
+        }
+        layer->weight_order.resize(layer->weights.size());
+        for (uint32_t i = 0; i < layer->weight_order.size(); ++i) {
+            layer->weight_order[i] = i;
+        }
+        std::sort(layer->weight_order.begin(), layer->weight_order.end(), [&](uint32_t a, uint32_t b) {
+            const auto & wa = layer->weights[a];
+            const auto & wb = layer->weights[b];
+            return wa.file_idx != wb.file_idx ? wa.file_idx < wb.file_idx : wa.offs < wb.offs;
+        });
+    }
     for (auto & [buft, ctx_ptr] : ctxs) {
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (dev == nullptr) {
@@ -377,7 +391,9 @@ void llama_moe_stream::start_workers_locked() {
 }
 
 void llama_moe_stream::worker_loop() {
-    uint8_t * staging = (uint8_t *) moe_stream_aligned_alloc(llama_moe_stream_staging_size(max_nb_expert, io_alignment), io_alignment);
+    GGML_ASSERT(max_nb_expert <= SIZE_MAX/LLAMA_MOE_STREAM_IO_BATCH);
+    const size_t staging_size = llama_moe_stream_staging_size(max_nb_expert*LLAMA_MOE_STREAM_IO_BATCH, io_alignment);
+    uint8_t * staging = (uint8_t *) moe_stream_aligned_alloc(staging_size, io_alignment);
     GGML_ASSERT(staging != nullptr);
 
     std::unique_lock<std::mutex> lock(mtx);
@@ -390,33 +406,66 @@ void llama_moe_stream::worker_loop() {
         const llama_moe_stream_work work = q_demand.front();
         q_demand.pop_front();
         auto & layer = *work.sl;
-        if (work.gen != layer.slot_gen[work.slot] || layer.slot_state[work.slot] != LLAMA_MOE_STREAM_SLOT_LOADING || layer.slot_expert[work.slot] != work.expert || layer.slot_claimed[work.slot]) {
+        bool valid = work.weight < layer.weights.size() && work.count > 0 && work.count <= LLAMA_MOE_STREAM_IO_BATCH;
+        for (uint32_t i = 0; valid && i < work.count; ++i) {
+            const auto & item = work.items[i];
+            valid = item.slot >= 0 && (uint32_t) item.slot < layer.n_slots && item.gen == layer.slot_gen[item.slot] && layer.slot_state[item.slot] == LLAMA_MOE_STREAM_SLOT_LOADING && layer.slot_expert[item.slot] == item.expert && layer.slot_pending[item.slot] > 0;
+        }
+        if (!valid) {
+            load_failed = true;
+            cv_done.notify_all();
             continue;
         }
-        layer.slot_claimed[work.slot] = 1;
+
+        const auto & weight = layer.weights[work.weight];
+        GGML_ASSERT(weight.nb_expert <= SIZE_MAX/work.count);
+        const size_t read_size = weight.nb_expert*work.count;
 
         lock.unlock();
         bool ok = true;
-        for (const auto & weight : layer.weights) {
-            const bool direct = use_direct_io && !direct_io_failed.load(std::memory_order_relaxed);
-            llama_file * file = direct || !use_direct_io ? files[weight.file_idx].get() : buffered_files[weight.file_idx].get();
-            llama_file * fallback = direct ? buffered_files[weight.file_idx].get() : nullptr;
-            bool fallback_used = false;
-            const uint8_t * data = llama_moe_stream_pread(*file, fallback, staging, weight.nb_expert, weight.offs + (size_t) work.expert*weight.nb_expert, direct, file->read_alignment(), &fallback_used);
-            if (fallback_used && !direct_io_failed.exchange(true, std::memory_order_relaxed)) {
-                LLAMA_LOG_WARN("%s: direct I/O read failed, using buffered expert reads\n", __func__);
+        int64_t n_upload_ops = 0;
+        int64_t t_read_us = 0;
+        int64_t t_upload_us = 0;
+        const bool direct = use_direct_io && !direct_io_failed.load(std::memory_order_relaxed);
+        llama_file * file = direct || !use_direct_io ? files[weight.file_idx].get() : buffered_files[weight.file_idx].get();
+        llama_file * fallback = direct ? buffered_files[weight.file_idx].get() : nullptr;
+        bool fallback_used = false;
+        const int64_t read_start = ggml_time_us();
+        const uint8_t * data = llama_moe_stream_pread(*file, fallback, staging, read_size, weight.offs + (size_t) work.items[0].expert*weight.nb_expert, direct, file->read_alignment(), &fallback_used);
+        t_read_us += ggml_time_us() - read_start;
+        if (fallback_used && !direct_io_failed.exchange(true, std::memory_order_relaxed)) {
+            LLAMA_LOG_WARN("%s: direct I/O read failed, using buffered expert reads\n", __func__);
+        }
+        if (data == nullptr) {
+            ok = false;
+        }
+        for (uint32_t first = 0; ok && first < work.count;) {
+            uint32_t run = 1;
+            while (first + run < work.count && work.items[first + run].slot == work.items[first + run - 1].slot + 1) {
+                run++;
             }
-            if (data == nullptr) {
-                ok = false;
-                break;
-            }
-            ggml_backend_tensor_set(weight.cache, data, (size_t) work.slot*weight.nb_expert, weight.nb_expert);
+            const int64_t upload_start = ggml_time_us();
+            ggml_backend_tensor_set(weight.cache, data + (size_t) first*weight.nb_expert, (size_t) work.items[first].slot*weight.nb_expert, (size_t) run*weight.nb_expert);
+            t_upload_us += ggml_time_us() - upload_start;
+            n_upload_ops++;
+            first += run;
         }
         lock.lock();
 
-        layer.slot_claimed[work.slot] = 0;
+        stats.n_weight_slices += work.count;
+        stats.n_read_ops++;
+        stats.n_read_bytes    += read_size;
+        stats.n_upload_ops    += n_upload_ops;
+        stats.t_read_us       += t_read_us;
+        stats.t_upload_us     += t_upload_us;
         if (ok) {
-            layer.slot_state[work.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+            for (uint32_t i = 0; i < work.count; ++i) {
+                const int32_t slot = work.items[i].slot;
+                GGML_ASSERT(layer.slot_pending[slot] > 0);
+                if (--layer.slot_pending[slot] == 0) {
+                    layer.slot_state[slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
+                }
+            }
         } else {
             load_failed = true;
         }
@@ -456,7 +505,9 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & layer, int32
         layer.expert_slot.erase(layer.slot_expert[slot]);
     }
     layer.slot_expert[slot] = expert;
-    layer.slot_state[slot] = LLAMA_MOE_STREAM_SLOT_LOADING;
+    GGML_ASSERT(layer.weights.size() <= UINT8_MAX);
+    layer.slot_pending[slot] = layer.weights.size();
+    layer.slot_state[slot] = layer.slot_pending[slot] > 0 ? LLAMA_MOE_STREAM_SLOT_LOADING : LLAMA_MOE_STREAM_SLOT_RESIDENT;
     layer.slot_gen[slot]++;
     layer.slot_last_use[slot] = ++layer.use_counter;
     layer.expert_slot[expert] = slot;
@@ -470,7 +521,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_stream::memory_breakdown(
         const auto buft = ctxs[i].first;
         result[buft] += no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctxs[i].second.get(), buft) : ggml_backend_buffer_get_size(bufs[i].get());
     }
-    const size_t staging_size = llama_moe_stream_staging_size(max_nb_expert, io_alignment);
+    GGML_ASSERT(max_nb_expert <= SIZE_MAX/LLAMA_MOE_STREAM_IO_BATCH);
+    const size_t staging_size = llama_moe_stream_staging_size(max_nb_expert*LLAMA_MOE_STREAM_IO_BATCH, io_alignment);
     GGML_ASSERT((size_t) n_io_threads <= SIZE_MAX/staging_size);
     result[ggml_backend_cpu_buffer_type()] += (size_t) n_io_threads*staging_size;
     return result;
@@ -480,6 +532,8 @@ void llama_moe_stream::print_stats() const {
     std::lock_guard<std::mutex> lock(mtx);
     const int64_t total = stats.n_hit + stats.n_miss;
     LLAMA_LOG_INFO("%s: MoE stream calls = %" PRId64 ", hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n", __func__, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold, total > 0 ? 100.0*stats.n_hit/total : 0.0);
+    LLAMA_LOG_INFO("%s: MoE stream reads = %" PRId64 " ops, %.2f GiB; uploads = %" PRId64 " ops\n", __func__, stats.n_read_ops, stats.n_read_bytes/1024.0/1024.0/1024.0, stats.n_upload_ops);
+    LLAMA_LOG_INFO("%s: MoE stream read time = %.2f ms, upload time = %.2f ms\n", __func__, stats.t_read_us/1000.0, stats.t_upload_us/1000.0);
     LLAMA_LOG_INFO("%s: MoE stream load stall = %.2f ms total (%.3f ms per call)\n", __func__, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
 }
 
@@ -560,14 +614,13 @@ static void llama_moe_stream_remap_impl(
         }
     }
     layer->demand_slots.clear();
+    layer->loads.clear();
     bool waited = false;
     for (const int32_t expert : layer->uniq) {
         const auto found = layer->expert_slot.find(expert);
         if (found != layer->expert_slot.end()) {
             const int32_t slot = found->second;
             if (layer->slot_state[slot] == LLAMA_MOE_STREAM_SLOT_LOADING) {
-                mgr->q_demand.push_back({ layer, expert, slot, layer->slot_gen[slot] });
-                mgr->cv_work.notify_one();
                 waited = true;
             }
             mgr->stats.n_hit++;
@@ -587,12 +640,33 @@ static void llama_moe_stream_remap_impl(
             mgr->stats.n_miss_cold++;
         }
         mgr->reserve_slot_locked(*layer, expert, victim);
-        mgr->q_demand.push_back({ layer, expert, victim, layer->slot_gen[victim] });
-        mgr->cv_work.notify_one();
         mgr->stats.n_miss++;
-        waited = true;
+        if (layer->slot_state[victim] == LLAMA_MOE_STREAM_SLOT_LOADING) {
+            layer->loads.push_back({ expert, victim, layer->slot_gen[victim] });
+            waited = true;
+        }
         layer->keep[victim] = 1;
         layer->demand_slots.push_back(victim);
+    }
+
+    if (!layer->loads.empty()) {
+        GGML_ASSERT(layer->weight_order.size() == layer->weights.size());
+        for (const uint32_t weight : layer->weight_order) {
+            for (size_t first = 0; first < layer->loads.size();) {
+                size_t count = 1;
+                while (count < LLAMA_MOE_STREAM_IO_BATCH && first + count < layer->loads.size() && layer->loads[first + count].expert == layer->loads[first + count - 1].expert + 1) {
+                    count++;
+                }
+                llama_moe_stream_work work;
+                work.sl = layer;
+                work.weight = weight;
+                work.count = count;
+                std::copy_n(layer->loads.begin() + first, count, work.items.begin());
+                mgr->q_demand.push_back(work);
+                first += count;
+            }
+        }
+        mgr->cv_work.notify_all();
     }
 
     if (waited) {

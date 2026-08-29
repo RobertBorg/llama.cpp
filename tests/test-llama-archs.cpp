@@ -1339,7 +1339,7 @@ static llama_moe_stream_layer * make_moe_stream_test_layer(
     layer->n_slots  = n_slots;
     layer->slot_expert.resize(n_slots, -1);
     layer->slot_state.resize(n_slots, LLAMA_MOE_STREAM_SLOT_EMPTY);
-    layer->slot_claimed.resize(n_slots, 0);
+    layer->slot_pending.resize(n_slots, 0);
     layer->slot_gen.resize(n_slots, 0);
     layer->slot_last_use.resize(n_slots, 0);
     layer->route_hotness.resize(n_expert, 0);
@@ -1681,7 +1681,7 @@ static void test_qwen4exp_moe_stream_exact() {
             }
         }
 
-        const size_t staging_size = stream->max_nb_expert + 2*4096;
+        const size_t staging_size = llama_moe_stream_staging_size(stream->max_nb_expert*LLAMA_MOE_STREAM_IO_BATCH, 4096);
         expected[ggml_backend_cpu_buffer_type()] += (size_t) stream->n_io_threads*staging_size;
         GGML_ASSERT(stream->memory_breakdown(no_alloc) == expected);
     };
@@ -1693,7 +1693,7 @@ static void test_qwen4exp_moe_stream_exact() {
         GGML_ASSERT(stream_one->max_nb_expert == stream_two->max_nb_expert);
 
         auto expected = one->memory_breakdown();
-        expected[ggml_backend_cpu_buffer_type()] += stream_one->max_nb_expert + 2*4096;
+        expected[ggml_backend_cpu_buffer_type()] += llama_moe_stream_staging_size(stream_one->max_nb_expert*LLAMA_MOE_STREAM_IO_BATCH, 4096);
         GGML_ASSERT(two->memory_breakdown() == expected);
     };
     assert_stream_memory(streamed.first.get(), false);
@@ -1856,18 +1856,30 @@ static void test_qwen4exp_moe_stream_exact() {
     GGML_ASSERT(parallel_expected == parallel_actual);
     if (parallel_stream->wave_supported) {
         int64_t n_seen = 0;
+        int64_t n_weight_slices = 0;
+        int64_t n_read_bytes = 0;
         bool exceeded_slots = false;
         for (const auto & layer : parallel_stream->layers) {
             if (!layer) {
                 continue;
             }
             const int64_t layer_seen = std::count(layer->seen.begin(), layer->seen.end(), 1);
+            size_t bytes_per_expert = 0;
+            for (const auto & weight : layer->weights) {
+                bytes_per_expert += weight.nb_expert;
+            }
             n_seen += layer_seen;
+            n_weight_slices += layer_seen*(int64_t) layer->weights.size();
+            n_read_bytes += layer_seen*(int64_t) bytes_per_expert;
             exceeded_slots = exceeded_slots || layer_seen > layer->n_slots;
         }
         GGML_ASSERT(exceeded_slots);
         GGML_ASSERT(parallel_stream->stats.n_miss == parallel_stream->stats.n_miss_cold);
         GGML_ASSERT(parallel_stream->stats.n_miss_cold == n_seen);
+        GGML_ASSERT(parallel_stream->stats.n_weight_slices == n_weight_slices);
+        GGML_ASSERT(parallel_stream->stats.n_read_bytes == n_read_bytes);
+        GGML_ASSERT(parallel_stream->stats.n_read_ops < parallel_stream->stats.n_weight_slices);
+        GGML_ASSERT(parallel_stream->stats.n_upload_ops < parallel_stream->stats.n_weight_slices);
     }
 
     const std::vector<llama_token> continuation = get_tokens(1, 128, seed + 2);
