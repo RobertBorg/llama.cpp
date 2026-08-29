@@ -167,6 +167,9 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--prefix-cache-dir PATH` | directory for persistent prefix cache chunks (default: disabled)<br/>(env: LLAMA_ARG_PREFIX_CACHE_DIR) |
+| `--prefix-cache-chunk-tokens N` | number of tokens per persistent prefix cache checkpoint (default: 8192, min: 16, max: 65536)<br/>(env: LLAMA_ARG_PREFIX_CACHE_CHUNK_TOKENS) |
+| `--prefix-cache-max N` | maximum persistent prefix cache size in MiB (default: 65536, -1 = no limit)<br/>(env: LLAMA_ARG_PREFIX_CACHE_MAX) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
@@ -455,6 +458,12 @@ docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:se
 # or, with CUDA:
 docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
 ```
+
+### Persistent prefix cache
+
+`--prefix-cache-dir` enables automatic NVMe-backed reuse of exact token prefixes. A checkpoint becomes eligible after the same boundary is observed in two distinct requests. Frequently reused checkpoints and checkpoints that save more tokens per stored byte remain longer when `--prefix-cache-max` is reached.
+
+This mode requires unified KV and reserves one hidden sequence. Only the first 65,536 prompt tokens are eligible for persistent checkpoints. The current format stores and hydrates a whole sequence snapshot synchronously; it does not page active KV state from NVMe. Use a dedicated cache directory. On Unix, it must only be accessible by its owner. Do not share one cache directory between concurrent server processes.
 
 ## Using with CURL
 

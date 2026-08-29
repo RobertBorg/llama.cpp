@@ -1,3 +1,5 @@
+import json
+import os
 import pytest
 import requests
 import time
@@ -661,3 +663,208 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+def test_completion_prefix_cache_promotes_repeated_chunk(tmp_path):
+    global server
+    server.n_slots = 2
+    server.kv_unified = True
+    server.server_slots = True
+    server.cache_ram = 0
+    server.temperature = 0.0
+    server.prefix_cache_dir = str(tmp_path / "prefix-cache")
+    server.prefix_cache_chunk_tokens = 16
+    server.start()
+
+    res = server.make_request("POST", "/tokenize", data={
+        "content": " Once upon a time" * 16,
+        "add_special": True,
+    })
+    assert res.status_code == 200
+    prefix = res.body["tokens"][:16]
+    assert len(prefix) == 16
+
+    def tokenize_suffix(text):
+        res = server.make_request("POST", "/tokenize", data={
+            "content": text,
+            "add_special": False,
+        })
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    suffix_a = tokenize_suffix(" Alice opened the red door." * 12)
+    suffix_b = tokenize_suffix(" Bob crossed the old bridge." * 12)
+    suffix_c = tokenize_suffix(" Clara climbed the green hill.")
+
+    for suffix in (suffix_a, suffix_b):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prefix + suffix,
+            "cache_prompt": False,
+            "n_predict": 1,
+            "temperature": 0.0,
+        })
+        assert res.status_code == 200
+    assert not list((tmp_path / "prefix-cache").rglob("*.json"))
+    assert not list((tmp_path / "prefix-cache").rglob("*.ggsq"))
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix_a,
+        "n_predict": 8,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    assert not list((tmp_path / "prefix-cache").rglob("*.json"))
+    assert not list((tmp_path / "prefix-cache").rglob("*.ggsq"))
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix_b,
+        "n_predict": 8,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    assert list((tmp_path / "prefix-cache").rglob("*.json"))
+    assert list((tmp_path / "prefix-cache").rglob("*.ggsq"))
+    server.stop()
+
+    cold = ServerPreset.tinyllama2()
+    cold.n_slots = 2
+    cold.kv_unified = True
+    cold.server_slots = True
+    cold.cache_ram = 0
+    cold.temperature = 0.0
+    cold.start()
+    res_cold = cold.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix_c,
+        "n_predict": 8,
+        "temperature": 0.0,
+    })
+    assert res_cold.status_code == 200
+    cold.stop()
+
+    server.start()
+    res_cached = server.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix_c,
+        "n_predict": 8,
+        "temperature": 0.0,
+    })
+    assert res_cached.status_code == 200
+    assert res_cached.body["content"] == res_cold.body["content"]
+    assert res_cached.body["timings"]["cache_n"] == len(prefix) - 1
+
+    server.stop()
+    blob = next((tmp_path / "prefix-cache").rglob("*.ggsq"))
+    blob.write_bytes(blob.read_bytes()[:32])
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prefix + suffix_c,
+        "n_predict": 1,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    assert not list((tmp_path / "prefix-cache").rglob("*.json"))
+    assert not list((tmp_path / "prefix-cache").rglob("*.ggsq"))
+
+    server.stop()
+    corrupt_manifest = tmp_path / "prefix-cache" / ("0" * 64 + ".json")
+    corrupt_manifest.write_text("{", encoding="utf-8")
+    server.start()
+    assert not corrupt_manifest.exists()
+
+    server.stop()
+    unrelated_json = tmp_path / "prefix-cache" / "notes.json"
+    unrelated_json.write_text("{}", encoding="utf-8")
+    server.start()
+    assert unrelated_json.exists()
+
+    server.stop()
+    nested = tmp_path / "prefix-cache" / "unrelated"
+    nested.mkdir()
+    nested_manifest = nested / ("1" * 64 + ".json")
+    nested_manifest.write_text("{", encoding="utf-8")
+    unrelated_temp = tmp_path / "prefix-cache" / "notes.json.tmp.1.1"
+    unrelated_temp.write_text("keep", encoding="utf-8")
+    os.utime(unrelated_temp, (0, 0))
+    server.start()
+    assert nested_manifest.exists()
+    assert unrelated_temp.exists()
+
+
+def test_completion_prefix_cache_retains_hot_chunks(tmp_path):
+    global server
+    server.n_ctx = 512
+    server.n_slots = 2
+    server.kv_unified = True
+    server.cache_ram = 0
+    server.temperature = 0.0
+    server.prefix_cache_dir = str(tmp_path / "prefix-cache")
+    server.prefix_cache_chunk_tokens = 256
+    server.prefix_cache_max = 1
+    server.start()
+
+    def tokenize(text, add_special):
+        res = server.make_request("POST", "/tokenize", data={
+            "content": text,
+            "add_special": add_special,
+        })
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    prefixes = []
+    for i in range(8):
+        tokens = tokenize((f" prefix-{i}") * 300, True)
+        prefixes.append(tokens[:256])
+        assert len(prefixes[-1]) == 256
+
+    def request(prefix, suffix):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prefix + tokenize(suffix, False),
+            "n_predict": 1,
+            "temperature": 0.0,
+        })
+        assert res.status_code == 200
+
+    request(prefixes[0], " hot-a")
+    request(prefixes[0], " hot-b")
+    for i in range(4):
+        request(prefixes[0], f" hot-hit-{i}")
+
+    server.stop()
+    server.start()
+
+    def read_manifests():
+        result = []
+        for path in (tmp_path / "prefix-cache").rglob("*.json"):
+            with open(path, encoding="utf-8") as file:
+                result.append(json.load(file))
+        return result
+
+    observed = {tuple(manifest["tokens"]) for manifest in read_manifests()}
+    for i, prefix in enumerate(prefixes[1:], 1):
+        request(prefix, f" cold-{i}-a")
+        request(prefix, f" cold-{i}-b")
+        observed.update(tuple(manifest["tokens"]) for manifest in read_manifests())
+
+    manifests = read_manifests()
+
+    assert observed == {tuple(prefix) for prefix in prefixes}
+    assert 0 < len(manifests) < len(prefixes)
+    hot = next(manifest for manifest in manifests if manifest["tokens"] == prefixes[0])
+    assert hot["retention"]["references"] == 6
+    assert hot["retention"]["gdsf_score"] > max(
+        manifest["retention"]["gdsf_score"] for manifest in manifests if manifest is not hot
+    )
+
+    old_namespaces = {manifest["namespace"] for manifest in manifests}
+    server.stop()
+    server.n_batch = 64
+    server.start()
+
+    new_prefix = tokenize(" new-model-namespace" * 300, True)[:256]
+    request(new_prefix, " new-a")
+    request(new_prefix, " new-b")
+    manifests = read_manifests()
+
+    new_manifest = next(manifest for manifest in manifests if manifest["tokens"] == new_prefix)
+    assert new_manifest["namespace"] not in old_namespaces
+    total_bytes = sum(path.stat().st_size for path in (tmp_path / "prefix-cache").rglob("*") if path.is_file())
+    assert total_bytes <= 1024 * 1024

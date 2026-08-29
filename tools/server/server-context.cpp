@@ -2,6 +2,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-prefix-cache.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -10,6 +11,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "hash/hash.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -21,6 +23,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -50,6 +53,75 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
+}
+
+static std::string server_prefix_cache_namespace(
+        const common_params & params,
+        const llama_model * model,
+        const llama_context * ctx) {
+    char model_desc[256] = {};
+    llama_model_desc(model, model_desc, sizeof(model_desc));
+    const char * file_identity = llama_model_file_identity(model);
+    if (file_identity == nullptr || file_identity[0] == '\0') {
+        return {};
+    }
+
+    json devices = json::array();
+    for (auto * device : params.devices) {
+        if (device != nullptr) {
+            devices.push_back(ggml_backend_dev_name(device));
+        }
+    }
+
+    json tensor_split = json::array();
+    for (size_t i = 0; i < llama_max_devices(); ++i) {
+        tensor_split.push_back(params.tensor_split[i]);
+    }
+
+    const std::string canonical = json {
+        {"schema", 2},
+        {"build", llama_build_info()},
+        {"model_desc", model_desc},
+        {"model_file_identity", file_identity},
+        {"model_size", llama_model_size(model)},
+        {"model_params", llama_model_n_params(model)},
+        {"n_ctx", llama_n_ctx(ctx)},
+        {"n_ctx_seq", llama_n_ctx_seq(ctx)},
+        {"n_parallel", params.n_parallel},
+        {"n_batch", params.n_batch},
+        {"n_ubatch", params.n_ubatch},
+        {"kv_unified", params.kv_unified},
+        {"type_k", static_cast<int>(params.cache_type_k)},
+        {"type_v", static_cast<int>(params.cache_type_v)},
+        {"swa_full", params.swa_full},
+        {"grp_attn_n", params.grp_attn_n},
+        {"grp_attn_w", params.grp_attn_w},
+        {"attention_type", static_cast<int>(params.attention_type)},
+        {"pooling_type", static_cast<int>(params.pooling_type)},
+        {"rope_scaling", static_cast<int>(params.rope_scaling_type)},
+        {"rope_freq_base", params.rope_freq_base},
+        {"rope_freq_scale", params.rope_freq_scale},
+        {"yarn_ext_factor", params.yarn_ext_factor},
+        {"yarn_attn_factor", params.yarn_attn_factor},
+        {"yarn_beta_fast", params.yarn_beta_fast},
+        {"yarn_beta_slow", params.yarn_beta_slow},
+        {"yarn_orig_ctx", params.yarn_orig_ctx},
+        {"flash_attn", static_cast<int>(params.flash_attn_type)},
+        {"no_kv_offload", params.no_kv_offload},
+        {"no_op_offload", params.no_op_offload},
+        {"no_extra_bufts", params.no_extra_bufts},
+        {"n_gpu_layers", params.n_gpu_layers},
+        {"main_gpu", params.main_gpu},
+        {"split_mode", static_cast<int>(params.split_mode)},
+        {"tensor_split", std::move(tensor_split)},
+        {"devices", std::move(devices)},
+        {"moe_stream", params.moe_stream},
+        {"moe_stream_slots", params.moe_stream_slots},
+        {"moe_stream_budget", params.moe_stream_budget},
+        {"moe_stream_io_threads", params.moe_stream_io_threads},
+        {"moe_stream_direct", params.moe_stream_direct},
+    }.dump();
+    return hash_sha256_hex(canonical.data(), canonical.size());
 }
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
@@ -296,6 +368,8 @@ struct server_slot {
 
     server_prompt prompt;
 
+    size_t prefix_cache_capture_len = 0;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -396,6 +470,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        prefix_cache_capture_len = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -913,6 +988,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_prefix_cache> prefix_cache;
 
     server_metrics metrics;
 
@@ -936,6 +1012,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        prefix_cache.reset();
         spec.reset();
         spec_init.reset();
 
@@ -1021,6 +1098,39 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+        const bool has_prefix_cache = !params_base.prefix_cache_dir.empty();
+
+        if (has_prefix_cache) {
+            const bool has_tensor_overrides = std::any_of(
+                params_base.tensor_buft_overrides.begin(), params_base.tensor_buft_overrides.end(),
+                [](const llama_model_tensor_buft_override & item) { return item.pattern != nullptr; });
+            if (!params_base.kv_unified) {
+                SRV_ERR("%s", "persistent prefix cache requires --kv-unified\n");
+                return false;
+            }
+            if (has_mmproj || has_spec || params_base.grp_attn_n != 1 || !params_base.lora_adapters.empty() ||
+                    !params_base.control_vectors.empty() || !params_base.kv_overrides.empty() ||
+                    has_tensor_overrides) {
+                SRV_ERR("%s", "persistent prefix cache does not support group attention, multimodal, speculative, adapter, or override state\n");
+                return false;
+            }
+            if (params_base.n_parallel >= 256) {
+                SRV_ERR("%s", "persistent prefix cache requires one free sequence ID\n");
+                return false;
+            }
+
+            params_base.n_seq_max = std::max(params_base.n_seq_max, params_base.n_parallel + 1);
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, params_base.n_seq_max);
+
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s", "context shift is disabled with persistent prefix cache\n");
+            }
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s", "cache reuse is disabled with persistent prefix cache\n");
+            }
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1311,6 +1421,28 @@ private:
             };
 
             slot.reset();
+        }
+
+        prefix_cache.reset();
+        if (has_prefix_cache) {
+            const uint64_t max_bytes = params_base.prefix_cache_max_mib < 0 ? 0 :
+                static_cast<uint64_t>(params_base.prefix_cache_max_mib) * 1024 * 1024;
+            if (max_bytes > std::numeric_limits<size_t>::max()) {
+                SRV_ERR("%s", "persistent prefix cache size is not supported on this platform\n");
+                return false;
+            }
+            auto cache = std::make_unique<server_prefix_cache>();
+            if (!cache->init(
+                    params_base.prefix_cache_dir,
+                    params_base.prefix_cache_chunk_tokens,
+                    static_cast<size_t>(max_bytes),
+                    server_prefix_cache_namespace(params_base, model_tgt, ctx_tgt),
+                    ctx_tgt,
+                    params_base.n_parallel)) {
+                SRV_WRN("persistent prefix cache is disabled because '%s' could not be initialized\n", params_base.prefix_cache_dir.c_str());
+            } else {
+                prefix_cache = std::move(cache);
+            }
         }
 
         {
@@ -1694,6 +1826,11 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.prefix_cache_capture_len = 0;
+        if (prefix_cache) {
+            task.params.n_cache_reuse = 0;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1805,6 +1942,23 @@ private:
 
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
+        if (prefix_cache && task.params.cache_prompt && task.type == SERVER_TASK_TYPE_COMPLETION &&
+                !task.is_parent() && !task.is_child()) {
+            const auto plan = prefix_cache->observe(task.tokens.get_tokens(), task.id);
+            const size_t n_local = slot.prompt.tokens.get_common_prefix(task.tokens);
+
+            if (plan.hit_len > 0 && plan.hit_len - 1 > n_local) {
+                llama_tokens restored;
+                slot.prompt_clear();
+                if (prefix_cache->restore(task.tokens.get_tokens(), slot.id, restored)) {
+                    slot.prompt.tokens = server_tokens(restored, false);
+                    SLT_INF(slot, "restored persistent prefix with %zu cached tokens\n", restored.size());
+                }
+            }
+
+            slot.prefix_cache_capture_len = plan.capture_len;
+        }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -3261,6 +3415,14 @@ private:
                                 n_past = 0;
                             }
 
+                            if (slot.prefix_cache_capture_len > 1) {
+                                const int n_capture = static_cast<int>(slot.prefix_cache_capture_len - 1);
+                                if (n_past > n_capture) {
+                                    SLT_DBG(slot, "limiting prompt reuse to persistent prefix boundary %d\n", n_capture);
+                                    n_past = n_capture;
+                                }
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3416,6 +3578,17 @@ private:
 
                     slot.mem.seq_rm(slot.id, p0, -1);
 
+                    if (slot.prefix_cache_capture_len > 1 &&
+                            slot.prompt.n_tokens() >= static_cast<int>(slot.prefix_cache_capture_len - 1)) {
+                        if (slot.prompt.n_tokens() == static_cast<int>(slot.prefix_cache_capture_len - 1)) {
+                            prefix_cache->capture(
+                                slot.task->tokens.get_tokens(),
+                                slot.prefix_cache_capture_len,
+                                slot.id);
+                        }
+                        slot.prefix_cache_capture_len = 0;
+                    }
+
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
                     // tokens before the invocation sequence need to be
@@ -3518,6 +3691,11 @@ private:
                             /* output    = */ slot.need_embd(),
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        if (slot.prefix_cache_capture_len > 1 &&
+                                slot.prompt.n_tokens() == static_cast<int>(slot.prefix_cache_capture_len - 1)) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3699,7 +3877,7 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (!try_clear_idle_slots() && !(prefix_cache && prefix_cache->evict_resident())) {
                 n_batch /= 2;
             }
 
@@ -3707,6 +3885,31 @@ private:
 
             return false; // retry with the updated n_batch
         } else {
+            if (prefix_cache) {
+                for (auto & slot : slots) {
+                    if (slot.prefix_cache_capture_len <= 1 ||
+                            slot.prompt.n_tokens() != static_cast<int>(slot.prefix_cache_capture_len - 1)) {
+                        continue;
+                    }
+
+                    int32_t i_last = -1;
+                    for (int32_t i = 0; i < batch.size(); ++i) {
+                        const auto & token = batch.tokens[i];
+                        if (token.id_slot == slot.id && token.is_prompt) {
+                            i_last = i;
+                        }
+                    }
+
+                    if (i_last >= off && i_last < off + batch_view.n_tokens) {
+                        prefix_cache->capture(
+                            slot.task->tokens.get_tokens(),
+                            slot.prefix_cache_capture_len,
+                            slot.id);
+                        slot.prefix_cache_capture_len = 0;
+                    }
+                }
+            }
+
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }

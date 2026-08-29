@@ -41,6 +41,82 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <io.h>
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#endif
+
+static bool append_file_identity(std::ostringstream & output, const llama_file & file) {
+#ifdef _WIN32
+    const intptr_t os_handle = _get_osfhandle(file.file_id());
+    if (os_handle == -1) {
+        return false;
+    }
+
+    BY_HANDLE_FILE_INFORMATION info = {};
+    FILE_BASIC_INFO basic = {};
+    const HANDLE handle = reinterpret_cast<HANDLE>(os_handle);
+    if (!GetFileInformationByHandle(handle, &info) ||
+            !GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic))) {
+        return false;
+    }
+
+    const uint64_t file_index = (uint64_t(info.nFileIndexHigh) << 32) | info.nFileIndexLow;
+    const uint64_t file_size  = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    const uint64_t write_time = (uint64_t(info.ftLastWriteTime.dwHighDateTime) << 32) | info.ftLastWriteTime.dwLowDateTime;
+    output << info.dwVolumeSerialNumber << ':' << file_index << ':' << file_size << ':' << write_time << ':' << basic.ChangeTime.QuadPart;
+#else
+    struct stat info = {};
+    if (fstat(file.file_id(), &info) != 0) {
+        return false;
+    }
+
+#if defined(__APPLE__) && (!defined(_POSIX_C_SOURCE) || defined(_DARWIN_C_SOURCE))
+    const int64_t ctime_sec  = info.st_ctimespec.tv_sec;
+    const int64_t ctime_nsec = info.st_ctimespec.tv_nsec;
+    const int64_t mtime_sec  = info.st_mtimespec.tv_sec;
+    const int64_t mtime_nsec = info.st_mtimespec.tv_nsec;
+#elif defined(__linux__) || defined(__ANDROID__) || defined(__FreeBSD__)
+    const int64_t ctime_sec  = info.st_ctim.tv_sec;
+    const int64_t ctime_nsec = info.st_ctim.tv_nsec;
+    const int64_t mtime_sec  = info.st_mtim.tv_sec;
+    const int64_t mtime_nsec = info.st_mtim.tv_nsec;
+#else
+    const int64_t ctime_sec  = info.st_ctime;
+    const int64_t ctime_nsec = 0;
+    const int64_t mtime_sec  = info.st_mtime;
+    const int64_t mtime_nsec = 0;
+#endif
+    output << uint64_t(info.st_dev) << ':' << uint64_t(info.st_ino) << ':' << uint64_t(info.st_size) << ':' <<
+        ctime_sec << ':' << ctime_nsec << ':' << mtime_sec << ':' << mtime_nsec;
+#endif
+    return true;
+}
+
+static std::string model_file_identity(const llama_model_loader & loader) {
+    if (loader.files.empty()) {
+        return {};
+    }
+
+    std::ostringstream output;
+    output << "loader-files-v1:" << loader.files.size();
+    for (size_t i = 0; i < loader.files.size(); ++i) {
+        output << ':' << i << ':';
+        if (!append_file_identity(output, *loader.files[i])) {
+            return {};
+        }
+    }
+    return output.str();
+}
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1144,6 +1220,8 @@ struct llama_model::impl {
 
     std::string desc_str;
 
+    std::string file_identity;
+
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
 
     // model memory mapped files
@@ -1194,6 +1272,7 @@ llama_model::~llama_model() {
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
+    pimpl->file_identity = model_file_identity(ml);
 }
 
 void llama_model_base::load_hparams(llama_model_loader & ml) {
@@ -1993,6 +2072,10 @@ llama_ftype llama_model::ftype() const {
 
 size_t llama_model::size() const {
     return pimpl->n_bytes;
+}
+
+const std::string & llama_model::file_identity() const {
+    return pimpl->file_identity;
 }
 
 size_t llama_model::n_tensors() const {
@@ -3207,6 +3290,10 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+const char * llama_model_file_identity(const llama_model * model) {
+    return model->file_identity().c_str();
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

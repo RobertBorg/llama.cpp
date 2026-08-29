@@ -725,6 +725,7 @@ struct llama_model {
     llama_ftype ftype() const;
 
     size_t size() const; // file size
+    const std::string & file_identity() const;
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;

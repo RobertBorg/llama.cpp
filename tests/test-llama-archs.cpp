@@ -929,6 +929,60 @@ static void test_qwen4exp_indexer_seq_cp() {
     GGML_ASSERT(actual == expected);
 }
 
+static void test_qwen4exp_unified_prefix_state() {
+    constexpr size_t   seed     = 3321213324;
+    constexpr uint32_t n_saved  = 11;
+    constexpr uint32_t n_tokens = 14;
+    constexpr uint32_t n_vocab  = 128;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 3, true);
+
+    llama_model * model = model_and_ctx.first.get();
+    llama_context * lctx = model_and_ctx.second.get();
+    llama_memory_t memory = llama_get_memory(lctx);
+
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+    const std::vector<llama_token> prefix(tokens.begin(), tokens.begin() + n_saved);
+    const std::vector<llama_token> replay(tokens.begin() + n_saved, tokens.end());
+
+    get_logits(model, lctx, prefix);
+
+    const size_t state_size = llama_state_seq_get_size(lctx, 0);
+    GGML_ASSERT(state_size > 0);
+    std::vector<uint8_t> state(state_size);
+    GGML_ASSERT(llama_state_seq_get_data(lctx, state.data(), state.size(), 0) == state.size());
+
+    const std::vector<float> expected = get_logits(model, lctx, replay, false, 0, n_saved);
+
+    llama_memory_clear(memory, true);
+    get_logits(model, lctx, get_tokens(3, n_vocab, seed + 1));
+
+    GGML_ASSERT(llama_state_seq_set_data(lctx, state.data(), state.size(), 2) == state.size());
+    GGML_ASSERT(llama_memory_seq_rm(memory, 0, -1, -1));
+    llama_memory_seq_cp(memory, 2, 0, -1, -1);
+    llama_memory_seq_cp(memory, 2, 1, -1, -1);
+
+    const size_t anchor_size = llama_state_seq_get_size(lctx, 2);
+    std::vector<uint8_t> anchor_before(anchor_size);
+    GGML_ASSERT(llama_state_seq_get_data(lctx, anchor_before.data(), anchor_before.size(), 2) == anchor_before.size());
+
+    get_logits(model, lctx, get_tokens(3, n_vocab, seed + 2), false, 0, n_saved);
+    get_logits(model, lctx, get_tokens(3, n_vocab, seed + 3), false, 1, n_saved);
+
+    std::vector<uint8_t> anchor_after(anchor_size);
+    GGML_ASSERT(llama_state_seq_get_data(lctx, anchor_after.data(), anchor_after.size(), 2) == anchor_after.size());
+    GGML_ASSERT(anchor_after == anchor_before);
+
+    GGML_ASSERT(llama_memory_seq_rm(memory, 0, -1, -1));
+    GGML_ASSERT(llama_memory_seq_rm(memory, 1, -1, -1));
+    llama_memory_seq_cp(memory, 2, 0, -1, -1);
+
+    const std::vector<float> actual = get_logits(model, lctx, replay, false, 0, n_saved);
+    GGML_ASSERT(actual == expected);
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1806,6 +1860,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_ple_split_mrope_history();
         test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
+        test_qwen4exp_unified_prefix_state();
         test_qwen4exp_qsa_unified_sequences();
         test_qwen4exp_qsa_non_causal();
         test_qwen4exp_qsa_norm_layout();

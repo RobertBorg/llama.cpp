@@ -895,6 +895,14 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
 
+    if (!params.prefix_cache_dir.empty() &&
+            (params.prefix_cache_chunk_tokens < 16 || params.prefix_cache_chunk_tokens > 65536)) {
+        throw std::invalid_argument("error: --prefix-cache-chunk-tokens must be between 16 and 65536 when --prefix-cache-dir is set\n");
+    }
+    if (!params.prefix_cache_dir.empty() && (params.prefix_cache_max_mib == 0 || params.prefix_cache_max_mib < -1)) {
+        throw std::invalid_argument("error: --prefix-cache-max must be positive or -1 when --prefix-cache-dir is set\n");
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -1718,6 +1726,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--prefix-cache-dir"}, "PATH",
+        "directory for persistent prefix cache chunks (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache_dir = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-chunk-tokens"}, "N",
+        string_format("number of tokens per persistent prefix cache checkpoint (default: %d, min: 16, max: 65536)", params.prefix_cache_chunk_tokens),
+        [](common_params & params, int value) {
+            params.prefix_cache_chunk_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_CHUNK_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--prefix-cache-max"}, "N",
+        string_format("maximum persistent prefix cache size in MiB (default: %d, -1 = no limit)", params.prefix_cache_max_mib),
+        [](common_params & params, int value) {
+            params.prefix_cache_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
