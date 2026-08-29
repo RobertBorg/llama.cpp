@@ -45,6 +45,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
     const int64_t ids_s0 = ids ? ids->nb[0] / ggml_type_size(ids->type) : 0;
     const int64_t ids_s1 = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    const bool masked = ids && ggml_mul_mat_id_get_masked(dst);
 
     mmf_ids_data ids_info{};
     mmf_ids_data * ids_info_ptr = nullptr;
@@ -78,6 +79,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         ids_src_compact_dev.alloc(ctx.pool(), ne_get_rows);
         ids_dst_compact_dev.alloc(ctx.pool(), ne_get_rows);
         expert_bounds_dev.alloc(ctx.pool(), n_experts + 1);
+
+        if (masked) {
+            CUDA_CHECK(cudaMemsetAsync(ids_src_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
+            CUDA_CHECK(cudaMemsetAsync(ids_dst_compact_dev.get(), 0, ne_get_rows*sizeof(int32_t), ctx.stream()));
+        }
 
         const int si1  = static_cast<int>(ids_s1);
         const int sis1 = static_cast<int>(src1->nb[2] / src1->nb[1]);

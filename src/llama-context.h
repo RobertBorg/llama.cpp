@@ -43,7 +43,8 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  bool moe_stream_lease);
 
     ~llama_context();
 
@@ -278,6 +279,7 @@ private:
     //
 
     const llama_model & model;
+    bool moe_stream_lease;
 
     llama_cparams cparams;
 

@@ -485,6 +485,12 @@ struct common_params {
 
     enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
 
+    bool     moe_stream            = false;
+    uint32_t moe_stream_slots      = 0;
+    uint64_t moe_stream_budget     = 0;
+    int32_t  moe_stream_io_threads = 0;
+    bool     moe_stream_direct     = false;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

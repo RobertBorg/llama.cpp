@@ -156,6 +156,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // masked GGML_OP_MUL_MAT_ID
+        bool mul_mat_id_masked;
     };
 
     // all the device properties

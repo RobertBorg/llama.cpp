@@ -1564,6 +1564,7 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const bool masked = ggml_mul_mat_id_get_masked(dst);
 
     void * wdata_cur = params->wdata;
 
@@ -1620,6 +1621,10 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        if (masked) {
+            memset(dst->data, 0, ggml_nbytes(dst));
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1628,6 +1633,9 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (masked && i02 == n_as) {
+                    continue;
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};

@@ -767,6 +767,7 @@ public:
 using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
 
 class llm_graph_result;
+struct llama_moe_stream;
 
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -785,6 +786,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llama_moe_stream             * mstream = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1025,6 +1027,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llama_moe_stream             * mstream;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1059,7 +1062,9 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * ids_scale = nullptr,
+                     bool   masked = false) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,

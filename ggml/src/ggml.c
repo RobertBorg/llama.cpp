@@ -3325,6 +3325,8 @@ void ggml_mul_mat_set_hint(
     in b, n_expert_used can be broadcasted to match the n_expert_used of ids
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
+
+    when masked is enabled, i == as->ne[2] writes zero
 */
 struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_context * ctx,
@@ -3350,6 +3352,21 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[2] = ids;
 
     return result;
+}
+
+void ggml_mul_mat_id_set_masked(
+        struct ggml_tensor * a,
+        bool                 masked) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+
+    ggml_set_op_params_i32(a, 0, masked ? 1 : 0);
+}
+
+bool ggml_mul_mat_id_get_masked(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+
+    return ggml_get_op_params_i32(a, 0) != 0;
 }
 
 // ggml_out_prod

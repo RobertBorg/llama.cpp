@@ -10,6 +10,7 @@
 #include "llama-vocab.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
 bool llama_model_saver_supports_arch(llm_arch arch) {
@@ -454,6 +455,10 @@ void llama_model_saver::add_kv_from_model() {
 }
 
 void llama_model_saver::add_tensors_from_model() {
+    if (model->moe_stream()) {
+        throw std::runtime_error("saving a model with MoE expert streaming is not supported");
+    }
+
     if (model->output != nullptr &&
             std::string(model->output->name) != std::string(model->tok_embd->name)) {
         add_tensor(model->tok_embd); // some models use the same tensor for tok_embd and output

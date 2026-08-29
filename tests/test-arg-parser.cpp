@@ -294,6 +294,32 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        common_params stream_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-stream-cache", "4G", "--moe-stream-io-threads", "3", "--moe-stream-direct"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
+        assert(stream_params.moe_stream);
+        assert(stream_params.moe_stream_budget == 4ull*1024*1024*1024);
+        assert(stream_params.moe_stream_slots == 0);
+        assert(stream_params.moe_stream_io_threads == 3);
+        assert(stream_params.moe_stream_direct);
+    }
+
+    {
+        common_params stream_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-stream-cache", "48s"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
+        assert(stream_params.moe_stream);
+        assert(stream_params.moe_stream_budget == 0);
+        assert(stream_params.moe_stream_slots == 48);
+    }
+
+    {
+        common_params stream_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-stream-cache", "4watts"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

@@ -495,6 +495,11 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
+    if (model->moe_stream()) {
+        LLAMA_LOG_ERROR("%s: saving a model with MoE expert streaming is not supported\n", __func__);
+        return;
+    }
+
     llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();

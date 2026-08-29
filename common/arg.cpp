@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -2795,6 +2796,64 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-stream"},
+        "stream routed MoE expert weights from disk on demand",
+        [](common_params & params) {
+            params.moe_stream = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM"));
+    add_opt(common_arg(
+        {"--moe-stream-cache"}, "<NG|Ns>",
+        "expert cache size for --moe-stream in GiB (for example 4G) or slots per layer (for example 48s); implies --moe-stream",
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const uint64_t n = std::stoull(value, &pos);
+            if (n == 0 || pos == 0) {
+                throw std::invalid_argument("invalid value");
+            }
+
+            std::string suffix = value.substr(pos);
+            std::transform(suffix.begin(), suffix.end(), suffix.begin(), [](unsigned char c) { return std::tolower(c); });
+
+            params.moe_stream = true;
+            if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                if (n > UINT32_MAX) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_stream_slots = n;
+                params.moe_stream_budget = 0;
+            } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                constexpr uint64_t gib = 1024ull*1024*1024;
+                if (n > UINT64_MAX/gib) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_stream_budget = n*gib;
+                params.moe_stream_slots = 0;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_CACHE"));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        "I/O threads for --moe-stream; implies --moe-stream (default: automatic)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_stream = true;
+            params.moe_stream_io_threads = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_IO_THREADS"));
+    add_opt(common_arg(
+        {"--moe-stream-direct"},
+        "use direct I/O for --moe-stream expert reads when available; implies --moe-stream",
+        [](common_params & params) {
+            params.moe_stream = true;
+            params.moe_stream_direct = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

@@ -184,13 +184,22 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
+    const bool masked = ggml_mul_mat_id_get_masked(dst);
+    static constexpr int64_t mmq_max_cols_per_block = 128;
+    const int64_t ids_padding = masked ? ne12 + mmq_max_cols_per_block : 0;
+
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + ids_padding);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    if (masked) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0, ne_get_rows*sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(ids_dst.get(), 0, (ne_get_rows + ids_padding)*sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -202,12 +211,22 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1_data = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block;
+    const int64_t ncols_padding_default = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
+    const int64_t ncols_padding = masked ? std::max(ncols_padding_default, mmq_max_cols_per_block) : ncols_padding_default;
+    const size_t nbytes_src1_q8_1 = nbytes_src1_q8_1_data + ncols_padding*sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    if (masked) {
+        CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get() + nbytes_src1_q8_1_data, 0,
+            ncols_padding*sizeof(block_q8_1_mmq), stream));
+    }
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-        src1_scale.alloc(ne12*n_expert_used);
+        src1_scale.alloc(ne12*n_expert_used + (masked ? mmq_max_cols_per_block : 0));
+        if (masked) {
+            CUDA_CHECK(cudaMemsetAsync(src1_scale.get(), 0,
+                (ne12*n_expert_used + mmq_max_cols_per_block)*sizeof(float), stream));
+        }
     }
 
     const int64_t ne11_flat = ne12*n_expert_used;

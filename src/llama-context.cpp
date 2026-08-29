@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-stream.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -82,8 +83,10 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
+              llama_context_params params,
+              bool moe_stream_lease) :
     model(model),
+    moe_stream_lease(moe_stream_lease),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -271,6 +274,28 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    if (model.moe_stream() && hparams.n_expert_used > 0) {
+        const uint32_t n_ubatch_max = std::max(1u, model.moe_stream()->n_slots/hparams.n_expert_used);
+        if (!model.moe_stream()->wave_supported) {
+            if (cparams.n_seq_max > n_ubatch_max) {
+                throw std::runtime_error("n_seq_max must be <= " + std::to_string(n_ubatch_max) + " for the MoE expert cache");
+            }
+            if (cparams.n_ubatch > n_ubatch_max) {
+                LLAMA_LOG_WARN("%s: n_ubatch reduced from %u to %u for the %u-slot expert cache\n", __func__, cparams.n_ubatch, n_ubatch_max, model.moe_stream()->n_slots);
+                cparams.n_ubatch = n_ubatch_max;
+            }
+        }
+
+        bool cache_on_host = false;
+        for (const auto & buffer : model.moe_stream()->bufs) {
+            cache_on_host = cache_on_host || ggml_backend_buffer_is_host(buffer.get());
+        }
+        if (cache_on_host && cparams.op_offload) {
+            LLAMA_LOG_WARN("%s: disabling op offload for a host expert cache\n", __func__);
+            cparams.op_offload = false;
+        }
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -499,6 +524,10 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    if (moe_stream_lease) {
+        model.moe_stream()->context_release();
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1331,6 +1360,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (model.moe_stream()) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2327,6 +2360,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         }
     }
 
+    const llama_moe_stream * stream = model.moe_stream();
+    if (stream && stream->wave_supported) {
+        uint64_t n_extra = 0;
+        for (const auto & layer : stream->layers) {
+            if (layer && layer->waves.size() > 1) {
+                n_extra += 64ull*(layer->waves.size() - 1);
+            }
+        }
+        res = (uint32_t) std::min<uint64_t>((uint64_t) UINT32_MAX, (uint64_t) res + n_extra);
+    }
+
     uint32_t n_sampling_nodes = 0;
     uint32_t n_sampling_nodes_max = 0;
     for (const auto & [seq_id, sampler] : sampling.samplers) {
@@ -2478,6 +2522,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.mstream     =*/ model.moe_stream(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3719,11 +3764,25 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    llama_moe_stream * moe_stream = model->moe_stream();
+    if (moe_stream && !moe_stream->context_acquire()) {
+        LLAMA_LOG_ERROR("%s: a model with MoE expert streaming supports only one context\n", __func__);
+        return nullptr;
+    }
+
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, moe_stream != nullptr);
         return ctx;
     } catch (const std::exception & err) {
+        if (moe_stream) {
+            moe_stream->context_release();
+        }
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
+    } catch (...) {
+        if (moe_stream) {
+            moe_stream->context_release();
+        }
+        LLAMA_LOG_ERROR("%s: failed to initialize the context: unknown error\n", __func__);
     }
 
     return nullptr;

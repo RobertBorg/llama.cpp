@@ -9,15 +9,21 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-moe-stream.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1039,6 +1045,481 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+static void test_qwen4exp_moe_stream_exact() {
+    constexpr size_t seed = 3321213324;
+
+    for (const size_t alignment : { 1, 2, 512, 8192 }) {
+        GGML_ASSERT(llama_moe_stream_alignment_supported(alignment));
+    }
+    for (const size_t alignment : { 0, 3, 6 }) {
+        GGML_ASSERT(!llama_moe_stream_alignment_supported(alignment));
+    }
+
+    const auto range_512 = llama_moe_stream_align_range(700, 400, 512);
+    GGML_ASSERT(range_512.offs == 512 && range_512.head == 188 && range_512.size == 1024);
+    const auto range_8192 = llama_moe_stream_align_range(8190, 4, 8192);
+    GGML_ASSERT(range_8192.offs == 0 && range_8192.head == 8190 && range_8192.size == 16384);
+    GGML_ASSERT(llama_moe_stream_staging_size(400, 512) == 1424);
+    GGML_ASSERT(llama_moe_stream_staging_size(400, 8192) == 16784);
+
+    for (const char * name : { "CPU", "CUDA", "ROCm", "MTL", "Vulkan" }) {
+        GGML_ASSERT(llama_moe_stream_backend_supported(name));
+    }
+    for (const char * name : { "OPENVINO", "MUSA", "RPC", "WebGPU" }) {
+        GGML_ASSERT(!llama_moe_stream_backend_supported(name));
+    }
+    GGML_ASSERT(!llama_moe_stream_backend_supported(nullptr));
+
+    const std::string path = (std::filesystem::temp_directory_path()/
+            ("llama-qwen4exp-moe-stream-" + std::to_string(ggml_time_us()) + ".gguf")).string();
+    struct cleanup_file {
+        const std::string & path;
+        ~cleanup_file() { std::remove(path.c_str()); }
+    } cleanup { path };
+    const std::string split_path_0 = path + ".split-0";
+    const std::string split_path_1 = path + ".split-1";
+    const std::string parallel_path = path + ".parallel";
+    cleanup_file cleanup_split_0 { split_path_0 };
+    cleanup_file cleanup_split_1 { split_path_1 };
+    cleanup_file cleanup_parallel { parallel_path };
+
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        auto source = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        llama_model_save_to_file(source.first.get(), path.c_str());
+
+        llama_model_saver full(source.first.get());
+        full.add_kv_from_model();
+        full.add_tensors_from_model();
+        gguf_context_ptr shard_0(gguf_init_empty());
+        gguf_context_ptr shard_1(gguf_init_empty());
+        gguf_set_kv(shard_0.get(), full.gguf_ctx);
+        gguf_set_kv(shard_1.get(), full.gguf_ctx);
+
+        const std::string split_no = "split.no";
+        const std::string split_count = "split.count";
+        const std::string split_tensors = "split.tensors.count";
+        const int64_t n_tensors = gguf_get_n_tensors(full.gguf_ctx);
+        GGML_ASSERT(n_tensors > 0 && n_tensors <= INT32_MAX);
+        for (uint16_t i = 0; i < 2; ++i) {
+            gguf_context * shard = i == 0 ? shard_0.get() : shard_1.get();
+            gguf_set_val_u16(shard, split_no.c_str(), i);
+            gguf_set_val_u16(shard, split_count.c_str(), 2);
+            gguf_set_val_i32(shard, split_tensors.c_str(), (int32_t) n_tensors);
+        }
+
+        bool placed_expert_in_second_shard = false;
+        for (const auto & [name, tensor] : llama_internal_get_tensor_map(source.first.get())) {
+            const bool use_second_shard = !placed_expert_in_second_shard && name.find(".ffn_gate_up_exps.weight") != std::string::npos;
+            gguf_add_tensor(use_second_shard ? shard_1.get() : shard_0.get(), tensor);
+            placed_expert_in_second_shard = placed_expert_in_second_shard || use_second_shard;
+        }
+        GGML_ASSERT(placed_expert_in_second_shard);
+        GGML_ASSERT(gguf_get_n_tensors(shard_0.get()) + gguf_get_n_tensors(shard_1.get()) == n_tensors);
+        gguf_write_to_file(shard_0.get(), split_path_0.c_str(), false);
+        gguf_write_to_file(shard_1.get(), split_path_1.c_str(), false);
+    }
+
+    {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        const std::string expert_count = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_EXPERT_COUNT);
+        const std::string expert_used_count = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_EXPERT_USED_COUNT);
+        GGML_ASSERT(gguf_find_key(gguf_ctx.get(), expert_count.c_str()) >= 0);
+        GGML_ASSERT(gguf_find_key(gguf_ctx.get(), expert_used_count.c_str()) >= 0);
+        gguf_set_val_u32(gguf_ctx.get(), expert_count.c_str(), 4);
+        gguf_set_val_u32(gguf_ctx.get(), expert_used_count.c_str(), 2);
+        auto source = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+        llama_model_save_to_file(source.first.get(), parallel_path.c_str());
+    }
+
+    const std::string empty_path = path + ".empty";
+    cleanup_file cleanup_empty { empty_path };
+    {
+        FILE * file = fopen(empty_path.c_str(), "wb");
+        GGML_ASSERT(file != nullptr);
+        fclose(file);
+    }
+    {
+        llama_file failed_file(empty_path.c_str(), "rb", false);
+        llama_file fallback_file(path.c_str(), "rb", false);
+        uint8_t read_buffer[4] = {};
+        bool fallback_used = false;
+        const uint8_t * data = llama_moe_stream_pread(failed_file, &fallback_file, read_buffer, sizeof(read_buffer), 0, true, 1, &fallback_used);
+        GGML_ASSERT(fallback_used);
+        GGML_ASSERT(data == read_buffer);
+        GGML_ASSERT(memcmp(data, "GGUF", sizeof(read_buffer)) == 0);
+    }
+
+#ifdef __linux__
+    llama_file direct_file(path.c_str(), "rb", true);
+    if (direct_file.has_direct_io()) {
+        llama_moe_stream direct_files(0, 1, 1, true);
+        direct_files.open_files({ path });
+        GGML_ASSERT(direct_files.use_direct_io);
+        GGML_ASSERT(direct_files.io_alignment == direct_file.read_alignment());
+        GGML_ASSERT(direct_files.buffered_files.size() == direct_files.files.size());
+    }
+
+    std::error_code proc_error;
+    if (std::filesystem::exists("/proc/version", proc_error)) {
+        llama_file buffered_file("/proc/version", "rb", true);
+        if (direct_file.has_direct_io() && !buffered_file.has_direct_io()) {
+            llama_moe_stream mixed_files(0, 1, 1, true);
+            mixed_files.open_files({ path, "/proc/version" });
+            GGML_ASSERT(!mixed_files.use_direct_io);
+            for (const auto & file : mixed_files.files) {
+                GGML_ASSERT(!file->has_direct_io());
+            }
+        }
+    }
+#endif
+
+    auto make_context_params = []() {
+        llama_context_params context_params = llama_context_default_params();
+        context_params.n_ctx = 64;
+        context_params.n_batch = 8;
+        context_params.n_ubatch = 1;
+        context_params.n_threads = 4;
+        context_params.n_threads_batch = 4;
+        context_params.op_offload = false;
+        return context_params;
+    };
+
+    auto make_model_params = [](bool stream) {
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = 0;
+        model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
+        model_params.use_extra_bufts = false;
+        model_params.moe_stream = stream;
+        model_params.moe_stream_slots = stream ? 1 : 0;
+        model_params.moe_stream_io_threads = stream ? 1 : 0;
+        return model_params;
+    };
+
+    auto load = [&](bool stream) {
+        llama_model_ptr model(llama_model_load_from_file(path.c_str(), make_model_params(stream)));
+        GGML_ASSERT(model);
+
+        llama_context_params context_params = make_context_params();
+        if (stream) {
+            context_params.n_ubatch = 8;
+            context_params.op_offload = true;
+        }
+        llama_context_ptr context(llama_init_from_model(model.get(), context_params));
+        GGML_ASSERT(context);
+        return std::make_pair(std::move(model), std::move(context));
+    };
+
+    llama_model_params small_budget_params = make_model_params(true);
+    small_budget_params.moe_stream_slots = 0;
+    small_budget_params.moe_stream_budget = 1;
+    llama_model_ptr small_budget(llama_model_load_from_file(path.c_str(), small_budget_params));
+    GGML_ASSERT(small_budget == nullptr);
+
+    llama_model_params mlock_params = make_model_params(true);
+    mlock_params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+    llama_model_ptr mlock(llama_model_load_from_file(path.c_str(), mlock_params));
+    GGML_ASSERT(mlock == nullptr);
+
+    auto baseline = load(false);
+    auto streamed = load(true);
+    GGML_ASSERT(llama_n_ubatch(streamed.second.get()) == 8);
+    GGML_ASSERT(!streamed.second->get_cparams().op_offload);
+
+    llama_model_params retry_params = make_model_params(true);
+    retry_params.moe_stream_direct = true;
+    llama_model_ptr retry_model(llama_model_load_from_file(path.c_str(), retry_params));
+    GGML_ASSERT(retry_model != nullptr);
+    llama_context_ptr retry_context(llama_init_from_model(retry_model.get(), make_context_params()));
+    GGML_ASSERT(retry_context != nullptr);
+    llama_moe_stream * retry_stream = retry_model->moe_stream();
+    GGML_ASSERT(retry_stream != nullptr);
+    const bool retry_supported = retry_stream->use_direct_io;
+    if (retry_supported) {
+        GGML_ASSERT(retry_stream->files.size() == 1 && retry_stream->buffered_files.size() == 1);
+        retry_stream->files[0].reset(new llama_file(empty_path.c_str(), "rb", false));
+    }
+
+    const char * split_paths[] = { split_path_0.c_str(), split_path_1.c_str() };
+    llama_model_ptr split_model(llama_model_load_from_splits(split_paths, 2, make_model_params(true)));
+    GGML_ASSERT(split_model != nullptr);
+    llama_context_ptr split_context(llama_init_from_model(split_model.get(), make_context_params()));
+    GGML_ASSERT(split_context != nullptr);
+    llama_moe_stream * split_stream = split_model->moe_stream();
+    GGML_ASSERT(split_stream != nullptr);
+
+    std::vector<gguf_context_ptr> split_metadata;
+    split_metadata.emplace_back(gguf_init_from_file(split_path_0.c_str(), { true, nullptr }));
+    split_metadata.emplace_back(gguf_init_from_file(split_path_1.c_str(), { true, nullptr }));
+    GGML_ASSERT(split_metadata[0] != nullptr && split_metadata[1] != nullptr);
+    bool seen_shard[2] = {};
+    const std::string cache_suffix = ".stream_cache";
+    for (const auto & layer : split_stream->layers) {
+        if (!layer) {
+            continue;
+        }
+        for (const auto & weight : layer->weights) {
+            GGML_ASSERT(weight.file_idx < 2);
+            std::string name = weight.cache->name;
+            GGML_ASSERT(name.size() > cache_suffix.size() && name.compare(name.size() - cache_suffix.size(), cache_suffix.size(), cache_suffix) == 0);
+            name.resize(name.size() - cache_suffix.size());
+            const int64_t tensor_id = gguf_find_tensor(split_metadata[weight.file_idx].get(), name.c_str());
+            GGML_ASSERT(tensor_id >= 0);
+            const size_t tensor_offs = gguf_get_tensor_offset(split_metadata[weight.file_idx].get(), tensor_id);
+            GGML_ASSERT(weight.offs == gguf_get_data_offset(split_metadata[weight.file_idx].get()) + tensor_offs);
+            if (weight.file_idx == 1) {
+                GGML_ASSERT(tensor_offs == 0);
+            }
+            seen_shard[weight.file_idx] = true;
+        }
+    }
+    GGML_ASSERT(seen_shard[0] && seen_shard[1]);
+
+    for (const auto & layer : streamed.first->moe_stream()->layers) {
+        if (!layer) {
+            continue;
+        }
+        for (const auto & weight : layer->weights) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight.cache->buffer);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            GGML_ASSERT(dev != nullptr && buft == ggml_backend_dev_buffer_type(dev));
+            GGML_ASSERT(reg != nullptr && llama_moe_stream_backend_supported(ggml_backend_reg_name(reg)));
+        }
+    }
+
+    auto assert_stream_memory = [](const llama_model * model, bool no_alloc) {
+        llama_moe_stream * stream = model->moe_stream();
+        GGML_ASSERT(stream != nullptr);
+
+        std::map<ggml_backend_buffer_type_t, size_t> expected;
+        if (no_alloc) {
+            for (const auto & [buft, ctx] : stream->ctxs) {
+                expected[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            }
+        } else {
+            for (const auto & buffer : stream->bufs) {
+                expected[ggml_backend_buffer_get_type(buffer.get())] += ggml_backend_buffer_get_size(buffer.get());
+            }
+        }
+
+        const size_t staging_size = stream->max_nb_expert + 2*4096;
+        expected[ggml_backend_cpu_buffer_type()] += (size_t) stream->n_io_threads*staging_size;
+        GGML_ASSERT(stream->memory_breakdown(no_alloc) == expected);
+    };
+    auto assert_thread_delta = [](const llama_model * one, const llama_model * two) {
+        llama_moe_stream * stream_one = one->moe_stream();
+        llama_moe_stream * stream_two = two->moe_stream();
+        GGML_ASSERT(stream_one != nullptr && stream_two != nullptr);
+        GGML_ASSERT(stream_one->n_io_threads == 1 && stream_two->n_io_threads == 2);
+        GGML_ASSERT(stream_one->max_nb_expert == stream_two->max_nb_expert);
+
+        auto expected = one->memory_breakdown();
+        expected[ggml_backend_cpu_buffer_type()] += stream_one->max_nb_expert + 2*4096;
+        GGML_ASSERT(two->memory_breakdown() == expected);
+    };
+    assert_stream_memory(streamed.first.get(), false);
+
+    llama_model_params two_thread_params = make_model_params(true);
+    two_thread_params.moe_stream_io_threads = 2;
+    llama_model_ptr two_thread(llama_model_load_from_file(path.c_str(), two_thread_params));
+    GGML_ASSERT(two_thread != nullptr);
+    assert_stream_memory(two_thread.get(), false);
+    assert_thread_delta(streamed.first.get(), two_thread.get());
+
+    llama_model_params no_alloc_params = make_model_params(true);
+    no_alloc_params.load_mode = LLAMA_LOAD_MODE_NONE;
+    no_alloc_params.no_alloc = true;
+    llama_model_ptr no_alloc(llama_model_load_from_file(path.c_str(), no_alloc_params));
+    GGML_ASSERT(no_alloc != nullptr);
+    assert_stream_memory(no_alloc.get(), true);
+
+    llama_model_params no_alloc_two_thread_params = no_alloc_params;
+    no_alloc_two_thread_params.moe_stream_io_threads = 2;
+    llama_model_ptr no_alloc_two_thread(llama_model_load_from_file(path.c_str(), no_alloc_two_thread_params));
+    GGML_ASSERT(no_alloc_two_thread != nullptr);
+    assert_stream_memory(no_alloc_two_thread.get(), true);
+    assert_thread_delta(no_alloc.get(), no_alloc_two_thread.get());
+
+    const std::string save_path = path + ".save";
+    cleanup_file cleanup_save { save_path };
+    constexpr char sentinel[] = "moe-stream-save-sentinel";
+    {
+        FILE * file = fopen(save_path.c_str(), "wb");
+        GGML_ASSERT(file != nullptr);
+        GGML_ASSERT(fwrite(sentinel, 1, sizeof(sentinel), file) == sizeof(sentinel));
+        fclose(file);
+    }
+    llama_model_save_to_file(streamed.first.get(), save_path.c_str());
+    {
+        char contents[sizeof(sentinel)] = {};
+        FILE * file = fopen(save_path.c_str(), "rb");
+        GGML_ASSERT(file != nullptr);
+        GGML_ASSERT(fread(contents, 1, sizeof(contents), file) == sizeof(contents));
+        GGML_ASSERT(fgetc(file) == EOF);
+        fclose(file);
+        GGML_ASSERT(memcmp(contents, sentinel, sizeof(contents)) == 0);
+    }
+
+    llama_context_ptr concurrent(llama_init_from_model(streamed.first.get(), make_context_params()));
+    GGML_ASSERT(concurrent == nullptr);
+    streamed.second.reset();
+
+    llama_context_params multi_seq_params = make_context_params();
+    multi_seq_params.n_seq_max = 2;
+    llama_context_ptr multi_seq(llama_init_from_model(streamed.first.get(), multi_seq_params));
+    GGML_ASSERT(multi_seq != nullptr);
+    multi_seq.reset();
+
+    llama_context_ptr replacement(llama_init_from_model(streamed.first.get(), make_context_params()));
+    GGML_ASSERT(replacement != nullptr);
+
+    const std::vector<llama_token> tokens = get_tokens(8, 128, seed);
+    const std::vector<float> expected = get_logits(baseline.first.get(), baseline.second.get(), tokens);
+    replacement->set_warmup(true);
+    const std::vector<float> actual = get_logits(streamed.first.get(), replacement.get(), tokens);
+    replacement->set_warmup(false);
+    GGML_ASSERT(expected == actual);
+    if (retry_supported) {
+        const std::vector<float> retry = get_logits(retry_model.get(), retry_context.get(), tokens);
+        GGML_ASSERT(expected == retry);
+        GGML_ASSERT(retry_stream->direct_io_failed.load(std::memory_order_relaxed));
+    }
+    const std::vector<float> split = get_logits(split_model.get(), split_context.get(), tokens);
+    GGML_ASSERT(expected == split);
+
+    llama_model_params parallel_baseline_params = make_model_params(false);
+    parallel_baseline_params.n_gpu_layers = 99;
+    llama_model_ptr parallel_baseline_model(llama_model_load_from_file(parallel_path.c_str(), parallel_baseline_params));
+    GGML_ASSERT(parallel_baseline_model != nullptr);
+    llama_context_params parallel_context_params = make_context_params();
+    parallel_context_params.n_ctx = 128;
+    parallel_context_params.n_batch = 64;
+    parallel_context_params.n_ubatch = 64;
+    llama_context_ptr parallel_baseline_context;
+
+    llama_model_params parallel_params = make_model_params(true);
+    parallel_params.n_gpu_layers = 99;
+    parallel_params.moe_stream_slots = 2;
+    parallel_params.moe_stream_io_threads = 2;
+    llama_model_ptr parallel_model(llama_model_load_from_file(parallel_path.c_str(), parallel_params));
+    GGML_ASSERT(parallel_model != nullptr);
+    llama_moe_stream * parallel_stream = parallel_model->moe_stream();
+    GGML_ASSERT(parallel_stream != nullptr);
+    llama_context_ptr parallel_context(llama_init_from_model(parallel_model.get(), parallel_context_params));
+    GGML_ASSERT(parallel_context != nullptr);
+    const uint32_t expected_ubatch = parallel_stream->wave_supported ? 64 : 1;
+    if (llama_n_ubatch(parallel_context.get()) != expected_ubatch) {
+        throw std::runtime_error("MoE stream prefill set n_ubatch to " + std::to_string(llama_n_ubatch(parallel_context.get())) + ", expected " + std::to_string(expected_ubatch));
+    }
+
+    llama_context_params parallel_baseline_context_params = parallel_context_params;
+    parallel_baseline_context_params.n_ubatch = expected_ubatch;
+    parallel_baseline_context.reset(llama_init_from_model(parallel_baseline_model.get(), parallel_baseline_context_params));
+    GGML_ASSERT(parallel_baseline_context != nullptr);
+
+    const std::vector<llama_token> parallel_tokens = get_tokens(64, 128, seed + 1);
+    const std::vector<float> parallel_expected = get_logits(parallel_baseline_model.get(), parallel_baseline_context.get(), parallel_tokens);
+    const std::vector<float> parallel_actual = get_logits(parallel_model.get(), parallel_context.get(), parallel_tokens);
+
+    bool has_gpu = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        has_gpu = has_gpu || ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    }
+    bool has_gpu_cache = false;
+    for (const auto & layer : parallel_stream->layers) {
+        if (!layer) {
+            continue;
+        }
+        for (const auto & weight : layer->weights) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight.cache->buffer);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            }
+            GGML_ASSERT(dev != nullptr && buft == ggml_backend_dev_buffer_type(dev));
+            has_gpu_cache = has_gpu_cache || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+    }
+    GGML_ASSERT(!has_gpu || has_gpu_cache);
+    llama_file parallel_file(parallel_path.c_str(), "rb", false);
+    for (const auto & layer : parallel_stream->layers) {
+        if (!layer) {
+            continue;
+        }
+        for (uint32_t slot = 0; slot < layer->n_slots; ++slot) {
+            GGML_ASSERT(layer->slot_state[slot] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
+            const int32_t expert = layer->slot_expert[slot];
+            GGML_ASSERT(expert >= 0 && (uint32_t) expert < layer->n_expert);
+            for (const auto & weight : layer->weights) {
+                std::vector<uint8_t> expected_data(weight.nb_expert);
+                std::vector<uint8_t> actual_data(weight.nb_expert);
+                parallel_file.seek(weight.offs + (size_t) expert*weight.nb_expert, SEEK_SET);
+                parallel_file.read_raw(expected_data.data(), expected_data.size());
+                ggml_backend_tensor_get(weight.cache, actual_data.data(), (size_t) slot*weight.nb_expert, actual_data.size());
+                GGML_ASSERT(expected_data == actual_data);
+            }
+        }
+    }
+    if (parallel_expected != parallel_actual) {
+        float max_abs_error = 0.0f;
+        size_t mismatch_count = 0;
+        size_t first_mismatch = parallel_expected.size();
+        for (size_t i = 0; i < parallel_expected.size(); ++i) {
+            const float abs_error = std::abs(parallel_expected[i] - parallel_actual[i]);
+            max_abs_error = std::max(max_abs_error, abs_error);
+            mismatch_count += parallel_expected[i] != parallel_actual[i];
+            if (first_mismatch == parallel_expected.size() && parallel_expected[i] != parallel_actual[i]) {
+                first_mismatch = i;
+            }
+        }
+        fprintf(stderr, "parallel MoE stream mismatch: NMSE = %.8e, max abs = %.8e, values = %zu/%zu, first token = %zu, first logit = %zu, misses = %" PRId64 "\n", nmse(parallel_expected, parallel_actual), max_abs_error, mismatch_count, parallel_expected.size(), first_mismatch/128, first_mismatch%128, parallel_stream->stats.n_miss);
+    }
+    GGML_ASSERT(parallel_expected == parallel_actual);
+    if (parallel_stream->wave_supported) {
+        int64_t n_seen = 0;
+        bool exceeded_slots = false;
+        for (const auto & layer : parallel_stream->layers) {
+            if (!layer) {
+                continue;
+            }
+            const int64_t layer_seen = std::count(layer->seen.begin(), layer->seen.end(), 1);
+            n_seen += layer_seen;
+            exceeded_slots = exceeded_slots || layer_seen > layer->n_slots;
+        }
+        GGML_ASSERT(exceeded_slots);
+        GGML_ASSERT(parallel_stream->stats.n_miss == parallel_stream->stats.n_miss_cold);
+        GGML_ASSERT(parallel_stream->stats.n_miss_cold == n_seen);
+    }
+
+    const std::vector<llama_token> continuation = get_tokens(1, 128, seed + 2);
+    const std::vector<float> continuation_expected = get_logits(parallel_baseline_model.get(), parallel_baseline_context.get(), continuation, false, 0, 64);
+    const std::vector<float> continuation_actual = get_logits(parallel_model.get(), parallel_context.get(), continuation, false, 0, 64);
+    GGML_ASSERT(continuation_expected == continuation_actual);
+    GGML_ASSERT(parallel_stream->workers.size() == 2);
+    GGML_ASSERT(parallel_stream->stats.n_miss > 2);
+
+    parallel_baseline_context.reset();
+    parallel_context.reset();
+    parallel_baseline_context.reset(llama_init_from_model(parallel_baseline_model.get(), parallel_baseline_context_params));
+    parallel_context.reset(llama_init_from_model(parallel_model.get(), parallel_context_params));
+    GGML_ASSERT(parallel_baseline_context != nullptr && parallel_context != nullptr);
+
+    const std::vector<llama_token> short_tokens = get_tokens(8, 128, seed + 3);
+    const std::vector<float> short_expected = get_logits(parallel_baseline_model.get(), parallel_baseline_context.get(), short_tokens);
+    const std::vector<float> short_actual = get_logits(parallel_model.get(), parallel_context.get(), short_tokens);
+    GGML_ASSERT(short_expected == short_actual);
+
+    llama_moe_stream * stream = streamed.first->moe_stream();
+    GGML_ASSERT(stream != nullptr);
+    GGML_ASSERT(stream->stats.n_calls > 0);
+    GGML_ASSERT(stream->stats.n_hit > 0);
+    GGML_ASSERT(stream->stats.n_miss > stream->stats.n_miss_cold);
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1103,6 +1584,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_qsa_norm_layout();
         test_qwen4exp_qsa_block_semantics();
         test_qwen4exp_qsa_pool_precision();
+        test_qwen4exp_moe_stream_exact();
     }
 
     struct user_data_t {

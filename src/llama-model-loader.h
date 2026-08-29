@@ -28,6 +28,8 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * weight, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev);
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -69,6 +71,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_STREAMED        = 1 << 6;
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -87,6 +90,7 @@ struct llama_model_loader {
     enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;
 
     llama_files files;
+    std::vector<std::string> file_paths;
     llama_ftype ftype;
     llama_fver  fver;
 

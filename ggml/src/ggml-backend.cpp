@@ -624,6 +624,15 @@ ggml_backend_buffer_t ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t d
 
 bool ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op) {
     GGML_ASSERT(device);
+
+    if (op->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_masked(op)) {
+        struct ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(device, &props);
+        if (!props.caps.mul_mat_id_masked) {
+            return false;
+        }
+    }
+
     return device->iface.supports_op(device, op);
 }
 
