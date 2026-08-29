@@ -2314,28 +2314,33 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted by the QSA mask
+        // self-attention restricted by the QSA selection
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * qsa_mask,
+                    ggml_tensor * qsa_selection,
+                           bool   sparse,
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        std::map<std::pair<uint32_t, bool>, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA mask for this layer's queries, or nullptr for dense
-        ggml_tensor * build_qsa_mask(
+        ggml_tensor * build_qsa_selection(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
+                           bool   sparse,
                             int * sections,
                             int   il);
+
+        bool supports_sparse_qsa(
+              llm_graph_input_attn_kv * inp,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+                            int64_t   ratio,
+                                int   il);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

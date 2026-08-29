@@ -8,10 +8,11 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    6
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    0
+#define RPC_PROTO_PATCH_VERSION    1
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_GLU == 100, "existing RPC op numbers have changed");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

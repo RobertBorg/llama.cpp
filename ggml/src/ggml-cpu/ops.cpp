@@ -8479,12 +8479,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         int64_t ic_start, int64_t ic_end,
         float * partials, int64_t partial_stride) {
 
-    const bool write_partials = (partials != nullptr);
-    const ggml_tensor * q     = dst->src[0];
-    const ggml_tensor * k     = dst->src[1];
-    const ggml_tensor * v     = dst->src[2];
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const bool indexed         = dst->op == GGML_OP_FLASH_ATTN_EXT_INDEXED;
+    const bool write_partials  = partials != nullptr;
+    const ggml_tensor * q      = dst->src[0];
+    const ggml_tensor * k      = dst->src[1];
+    const ggml_tensor * v      = dst->src[2];
+    const ggml_tensor * mask   = indexed ? nullptr : dst->src[3];
+    const ggml_tensor * indices = indexed ? dst->src[3] : nullptr;
+    const ggml_tensor * sinks  = dst->src[4];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8505,7 +8507,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    const bool v_contiguous = nbv0 == ggml_type_size(v->type);
+    GGML_ASSERT(v_contiguous || (indexed && ggml_blck_size(v->type) == 1));
 
     GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
@@ -8573,13 +8576,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
         ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (v->type == GGML_TYPE_F16) {
+        const bool v_f16_acc = v->type == GGML_TYPE_F16 && v_contiguous;
+        if (v_f16_acc) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const char * ip = indices ? (const char *) indices->data + iq1*indices->nb[1] + iq3*indices->nb[3] : nullptr;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8593,10 +8598,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         q_to_vec_dot(pq, Q_q, DK);
 
         // online softmax / attention
-        // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        for (int64_t ii = ic_start; ii < ic_end; ++ii) {
+            int64_t ic = ii;
+            if (ip) {
+                const int32_t index = *(const int32_t *) (ip + ii*indices->nb[0]);
+                if (index < 0 || index >= nek1) {
+                    continue;
+                }
+                ic = index;
+            }
+
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -8622,7 +8635,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (v->type == GGML_TYPE_F16) {
+            if (v_f16_acc) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -8651,7 +8664,17 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                if (!v_contiguous) {
+                    for (int64_t d = 0; d < DV; ++d) {
+                        const char * value = v_data + d*nbv0;
+                        if (v_to_float) {
+                            v_to_float(value, &V32[d], 1);
+                        } else {
+                            V32[d] = *(const float *) value;
+                        }
+                    }
+                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -8663,7 +8686,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (v->type == GGML_TYPE_F16) {
+        if (v_f16_acc) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -9074,9 +9097,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
-    const ggml_tensor * q     = dst->src[0];
-    const ggml_tensor * k     = dst->src[1];
-    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * indices = dst->op == GGML_OP_FLASH_ATTN_EXT_INDEXED ? dst->src[3] : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9098,7 +9122,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
     GGML_ASSERT(nbk0 == ggml_type_size(k->type));
-    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type) ||
+            (indices && ggml_blck_size(v->type) == 1));
 
     GGML_ASSERT(neq0 == DK);
     GGML_ASSERT(nek0 == DK);
@@ -9119,7 +9144,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !indices && !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9176,7 +9201,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !indices && !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9198,7 +9223,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                const int64_t n_attn = indices ? indices->ne[0] : nek1;
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_attn, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
@@ -12016,6 +12042,128 @@ void ggml_compute_forward_lightning_indexer(
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
+        }
+    }
+}
+
+struct qsa_candidate {
+    float score;
+    int32_t block;
+};
+
+static_assert(sizeof(qsa_candidate) == 2*sizeof(int32_t), "unexpected QSA candidate size");
+
+static bool qsa_candidate_better(const qsa_candidate & a, const qsa_candidate & b) {
+    return a.score != b.score ? a.score > b.score : a.block < b.block;
+}
+
+static bool qsa_candidate_worse(const qsa_candidate & a, const qsa_candidate & b) {
+    return a.score != b.score ? a.score < b.score : a.block > b.block;
+}
+
+void ggml_compute_forward_qsa_indexer(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q           = dst->src[0];
+    const ggml_tensor * k           = dst->src[1];
+    const ggml_tensor * block_cells = dst->src[2];
+    const ggml_tensor * visible     = dst->src[3];
+    const ggml_tensor * tail        = dst->src[4];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(visible->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(q->nb[0] == sizeof(float));
+    GGML_ASSERT(k->nb[0] == sizeof(float));
+    GGML_ASSERT(block_cells->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(visible->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(tail->nb[0] == sizeof(int32_t));
+
+    const int32_t block_size  = ggml_get_op_params_i32(dst, 0);
+    const int32_t token_top_k = ggml_get_op_params_i32(dst, 1);
+    const int32_t block_top_k = token_top_k/block_size;
+
+    const int64_t n_embd   = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_query  = q->ne[2];
+    const int64_t n_lane   = q->ne[3];
+    const int64_t n_blocks = k->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t candidate_pad = CACHE_LINE_SIZE/sizeof(qsa_candidate);
+    qsa_candidate * heap = (qsa_candidate *) params->wdata + ith*(block_top_k + candidate_pad);
+
+    for (int64_t row = ith; row < n_query*n_lane; row += nth) {
+        const int64_t query = row % n_query;
+        const int64_t lane  = row / n_query;
+        const int32_t n_visible = *(const int32_t *) ((const char *) visible->data + query*visible->nb[1] + lane*visible->nb[3]);
+        GGML_ASSERT(n_visible >= 0 && n_visible <= n_blocks);
+
+        int32_t n_heap = 0;
+        for (int32_t block = 0; block < n_visible; ++block) {
+            const float * k_row = (const float *) ((const char *) k->data + block*k->nb[1] + lane*k->nb[3]);
+            float score = 0.0f;
+            for (int64_t head = 0; head < n_head; ++head) {
+                const float * q_row = (const float *) ((const char *) q->data + head*q->nb[1] + query*q->nb[2] + lane*q->nb[3]);
+                float qk = 0.0f;
+                ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row, 0, 1);
+                score += qk > 0.0f ? qk : 0.0f;
+            }
+
+            const qsa_candidate candidate = { score, block };
+            if (n_heap < block_top_k) {
+                int32_t child = n_heap++;
+                heap[child] = candidate;
+                while (child > 0) {
+                    const int32_t parent = (child - 1)/2;
+                    if (!qsa_candidate_worse(heap[child], heap[parent])) {
+                        break;
+                    }
+                    std::swap(heap[child], heap[parent]);
+                    child = parent;
+                }
+            } else if (qsa_candidate_better(candidate, heap[0])) {
+                heap[0] = candidate;
+                int32_t parent = 0;
+                while (true) {
+                    const int32_t left = 2*parent + 1;
+                    if (left >= n_heap) {
+                        break;
+                    }
+                    const int32_t right = left + 1;
+                    const int32_t child = right < n_heap && qsa_candidate_worse(heap[right], heap[left]) ? right : left;
+                    if (!qsa_candidate_worse(heap[child], heap[parent])) {
+                        break;
+                    }
+                    std::swap(heap[child], heap[parent]);
+                    parent = child;
+                }
+            }
+        }
+
+        std::sort(heap, heap + n_heap, qsa_candidate_better);
+
+        int32_t * dst_row = (int32_t *) ((char *) dst->data + query*dst->nb[1] + lane*dst->nb[3]);
+        std::fill(dst_row, dst_row + dst->ne[0], -1);
+
+        const int32_t * cell_row = (const int32_t *) ((const char *) block_cells->data + lane*block_cells->nb[3]);
+        for (int32_t selected = 0; selected < n_heap; ++selected) {
+            const int32_t block = heap[selected].block;
+            for (int32_t member = 0; member < block_size; ++member) {
+                dst_row[selected*block_size + member] = cell_row[block*block_size + member];
+            }
+        }
+
+        const int32_t * tail_row = (const int32_t *) ((const char *) tail->data + query*tail->nb[1] + lane*tail->nb[3]);
+        for (int32_t member = 0; member < block_size - 1; ++member) {
+            dst_row[token_top_k + member] = tail_row[member];
         }
     }
 }

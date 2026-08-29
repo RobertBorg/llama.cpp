@@ -2006,6 +2006,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_fill(params, tensor);
             } break;
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
@@ -2071,6 +2072,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
+        case GGML_OP_QSA_INDEXER:
+            {
+                ggml_compute_forward_qsa_indexer(params, tensor);
             } break;
         case GGML_OP_DSV4_HC_COMB:
             {
@@ -2404,12 +2409,17 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_QSA_INDEXER:
+            {
+                n_tasks = MIN(n_threads, node->src[0]->ne[2]*node->src[0]->ne[3]);
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
@@ -2957,10 +2967,16 @@ struct ggml_cplan ggml_graph_plan(
                         cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
+                case GGML_OP_FLASH_ATTN_EXT_INDEXED:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
+
+                        if (node->op == GGML_OP_FLASH_ATTN_EXT_INDEXED) {
+                            cur += sizeof(float)*(DK + 2*DV + CACHE_LINE_SIZE_F32)*n_tasks;
+                            break;
+                        }
 
                         // Tiled flash attention scratch (tile sizes defined in common.h)
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
@@ -3010,6 +3026,12 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_QSA_INDEXER:
+                    {
+                        const int64_t block_size  = ggml_get_op_params_i32(node, 0);
+                        const int64_t token_top_k = ggml_get_op_params_i32(node, 1);
+                        cur += 2*sizeof(int32_t)*(token_top_k/block_size)*n_tasks;
                     } break;
                 default:
                     break;

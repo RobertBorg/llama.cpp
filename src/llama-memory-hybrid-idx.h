@@ -132,7 +132,8 @@ public:
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks follow logical token order, not cache cell order.
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * blk_bias, ggml_tensor * tail_cells, const llama_ubatch * ubatch,
+                       ggml_tensor * blk_bias, ggml_tensor * visible_blocks, ggml_tensor * tail_cells,
+                       const llama_ubatch * ubatch,
                        uint32_t ratio, bool causal_attn) const;
 
 private:

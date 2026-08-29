@@ -2158,6 +2158,7 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
         /* .buffer_from_host_ptr  = */ false,
         /* .events                = */ true,
         /* .mmap_support          = */ true,
+        /* .mul_mat_id_masked     = */ false,
     };
 }
 
@@ -2179,8 +2180,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
     //TODO: call the remote backend and cache the results
+    if (op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED || op->op == GGML_OP_QSA_INDEXER) {
+        return false;
+    }
     return true;
 }
 

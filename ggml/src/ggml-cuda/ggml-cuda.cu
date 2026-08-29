@@ -39,6 +39,7 @@
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
+#include "ggml-cuda/qsa-indexer.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
@@ -2401,6 +2402,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
+            break;
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            ggml_cuda_flash_attn_ext_indexed(ctx, dst);
+            break;
+        case GGML_OP_QSA_INDEXER:
+            ggml_cuda_qsa_indexer(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
@@ -5345,6 +5352,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            return ggml_cuda_flash_attn_ext_indexed_supported(dev_ctx->device, op);
+        case GGML_OP_QSA_INDEXER:
+            return ggml_cuda_qsa_indexer_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

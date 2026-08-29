@@ -590,6 +590,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FLASH_ATTN_EXT_INDEXED,
+        GGML_OP_QSA_INDEXER,
+
         GGML_OP_COUNT,
     };
 
@@ -2447,6 +2450,21 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // q:       [n_embd_k, n_batch,    n_head,    ne3]
+    // k:       [n_embd_k, n_kv,       n_head_kv, ne3]
+    // v:       [n_embd_v, n_kv,       n_head_kv, ne3]
+    // indices: [n_index,  n_batch,     1,         ne3]
+    // res:     [n_embd_v, n_head,      n_batch,   ne3]
+    //
+    // Negative and out-of-range indices are ignored.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * indices,
+            float                 scale);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2622,6 +2640,26 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // QSA block indexer
+    //
+    // Ranks visible blocks by sum_h(max(dot(q_h, k_block), 0)) and expands them through block_cells.
+    // Ties use the lower block index. Tail IDs are appended unchanged.
+    // q:             [n_embd, n_head,                n_query,  n_lane]
+    // k:             [n_embd, n_block,               1,        n_lane]
+    // block_cells:   [block_size*n_block,            1,        1, n_lane]
+    // visible:       [1,      n_query,               1,        n_lane]
+    // tail:          [max(1, block_size - 1), n_query, 1,      n_lane]
+    // res:           [token_top_k + block_size - 1, n_query,   1, n_lane]
+    GGML_API struct ggml_tensor * ggml_qsa_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * block_cells,
+        struct ggml_tensor  * visible,
+        struct ggml_tensor  * tail,
+        int32_t               block_size,
+        int32_t               token_top_k);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

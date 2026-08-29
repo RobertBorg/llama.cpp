@@ -7248,6 +7248,182 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT_INDEXED
+struct test_flash_attn_ext_indexed : public test_case {
+    const int64_t hsk;
+    const int64_t hsv;
+    const int64_t nh;
+    const int64_t nr2;
+    const int64_t kv;
+    const int64_t nq;
+    const int64_t n_ids;
+    const ggml_type type_K;
+    const ggml_type type_V;
+    const bool all_invalid;
+    const bool all_ids;
+    const bool scattered_ids;
+
+    std::string vars() override {
+        return VARS_TO_STR12(hsk, hsv, nh, nr2, kv, nq, n_ids, type_K, type_V, all_invalid, all_ids, scattered_ids);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_INDEXED";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_indexed(
+            int64_t hsk = 64,
+            int64_t hsv = 64,
+            int64_t nh = 1,
+            int64_t nr2 = 4,
+            int64_t kv = 17,
+            int64_t nq = 3,
+            int64_t n_ids = 7,
+            ggml_type type_K = GGML_TYPE_F16,
+            ggml_type type_V = GGML_TYPE_F16,
+            bool all_invalid = false,
+            bool all_ids = false,
+            bool scattered_ids = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr2(nr2), kv(kv), nq(nq), n_ids(n_ids), type_K(type_K), type_V(type_V), all_invalid(all_invalid), all_ids(all_ids), scattered_ids(scattered_ids) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nq, nh*nr2, 2);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, kv, nh, 2);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_V, hsv, kv, nh, 2);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * ids = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_ids, nq, 1, 2);
+        ggml_set_name(ids, "ids");
+
+        const float scale = 1.0f/sqrtf(hsk);
+
+        ggml_tensor * indexed = ggml_flash_attn_ext_indexed(ctx, q, k, v, ids, scale);
+        ggml_set_name(indexed, "indexed");
+
+        if (all_invalid) {
+            return indexed;
+        }
+
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nq, 1, 2);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * dense = ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(dense, GGML_PREC_F32);
+        ggml_set_name(dense, "dense");
+
+        ggml_tensor * out = ggml_concat(ctx, indexed, dense, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<int32_t> ids_data(n_ids*nq*2, -1);
+        std::vector<ggml_fp16_t> mask_data(kv*nq*2, ggml_fp32_to_fp16(-INFINITY));
+
+        const std::array<std::vector<int32_t>, 6> rows = {{
+            { 0, (int32_t) kv - 1, 5 },
+            { 8, 2, 14, 1 },
+            { 10 },
+            { 0, (int32_t) kv - 1, 3, 7, 12 },
+            { 4, 9, 15 },
+            { (int32_t) kv - 1, 0, 6, 11, 2, 14, 8 },
+        }};
+
+        if (all_ids) {
+            GGML_ASSERT(n_ids == kv);
+            for (int64_t row = 0; row < nq*2; ++row) {
+                for (int64_t i = 0; i < n_ids; ++i) {
+                    ids_data[i + n_ids*row] = i;
+                    mask_data[i + kv*row] = ggml_fp32_to_fp16(0.0f);
+                }
+            }
+        } else if (scattered_ids) {
+            for (int64_t row = 0; row < nq*2; ++row) {
+                const std::array<int32_t, 7> row_ids = {
+                    (int32_t) (kv - 1 - row),
+                    (int32_t) (kv/2 + row),
+                    (int32_t) row,
+                    (int32_t) (kv - 17 - 3*row),
+                    (int32_t) (kv/3 + 5*row),
+                    -1,
+                    (int32_t) kv,
+                };
+                for (int64_t i = 0; i < (int64_t) row_ids.size(); ++i) {
+                    const int32_t id = row_ids[i];
+                    ids_data[i + n_ids*row] = id;
+                    if (id >= 0 && id < kv) {
+                        mask_data[id + kv*row] = ggml_fp32_to_fp16(0.0f);
+                    }
+                }
+            }
+        } else if (!all_invalid) {
+            for (int64_t row = 0; row < (int64_t) rows.size(); ++row) {
+                for (int64_t i = 0; i < (int64_t) rows[row].size(); ++i) {
+                    const int32_t id = rows[row][i];
+                    ids_data[i + n_ids*row] = id;
+                    mask_data[id + kv*row] = ggml_fp32_to_fp16(0.0f);
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                ggml_backend_tensor_set(t, ids_data.data(), 0, ids_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                ggml_backend_tensor_set(t, mask_data.data(), 0, mask_data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (all_invalid) {
+            double result = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                result = std::max(result, (double) fabsf(a[i]));
+                result = std::max(result, (double) fabsf(b[i]));
+            }
+            return result;
+        }
+
+        GGML_ASSERT(n % (2*hsv) == 0);
+
+        const size_t n_rows = n/(2*hsv);
+        std::vector<float> a_indexed(n_rows*hsv);
+        std::vector<float> a_dense  (n_rows*hsv);
+        std::vector<float> b_indexed(n_rows*hsv);
+        std::vector<float> b_dense  (n_rows*hsv);
+
+        for (size_t row = 0; row < n_rows; ++row) {
+            memcpy(a_indexed.data() + row*hsv, a + row*2*hsv,       hsv*sizeof(float));
+            memcpy(a_dense  .data() + row*hsv, a + row*2*hsv+hsv, hsv*sizeof(float));
+            memcpy(b_indexed.data() + row*hsv, b + row*2*hsv,       hsv*sizeof(float));
+            memcpy(b_dense  .data() + row*hsv, b + row*2*hsv+hsv, hsv*sizeof(float));
+        }
+
+        return std::max({
+            nmse(a, b, n),
+            nmse(a_indexed.data(), a_dense.data(), a_indexed.size()),
+            nmse(b_indexed.data(), b_dense.data(), b_indexed.size()),
+        });
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -7672,6 +7848,176 @@ struct test_lightning_indexer : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// GGML_OP_QSA_INDEXER
+struct test_qsa_indexer : public test_case {
+    static constexpr int64_t hsk          = 128;
+    static constexpr int64_t nh           = 4;
+    static constexpr int64_t n_blocks     = 1031;
+    static constexpr int64_t n_queries    = 8;
+    static constexpr int64_t n_lanes      = 2;
+    static constexpr int64_t block_size   = 4;
+    static constexpr int64_t token_top_k  = 2048;
+    static constexpr int64_t block_top_k  = token_top_k/block_size;
+    static constexpr int64_t n_block_cells = block_size*n_blocks;
+    static constexpr int64_t n_ids         = token_top_k + block_size - 1;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hsk, nh, n_blocks, n_queries, n_lanes, block_size, token_top_k, n_ids);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_INDEXER";
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, n_queries, n_lanes);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, n_blocks, 1, n_lanes);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * block_cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_block_cells, 1, 1, n_lanes);
+        ggml_set_name(block_cells, "block_cells");
+
+        ggml_tensor * visible = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, n_queries, 1, n_lanes);
+        ggml_set_name(visible, "visible");
+
+        ggml_tensor * tail = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, block_size - 1, n_queries, 1, n_lanes);
+        ggml_set_name(tail, "tail");
+
+        ggml_tensor * expected = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_ids, n_queries, 1, n_lanes);
+        ggml_set_name(expected, "expected");
+
+        ggml_tensor * selected = ggml_qsa_indexer(
+                ctx, q, k, block_cells, visible, tail, block_size, token_top_k);
+        ggml_set_name(selected, "selected");
+
+        ggml_tensor * out = ggml_concat(ctx, selected, expected, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<float> q_data(hsk*nh*n_queries*n_lanes, 0.0f);
+        std::vector<float> k_data(hsk*n_blocks*n_lanes, 0.0f);
+        std::vector<int32_t> block_cells_data(n_block_cells*n_lanes);
+        std::vector<int32_t> visible_data(n_queries*n_lanes);
+        std::vector<int32_t> tail_data((block_size - 1)*n_queries*n_lanes, -1);
+        std::vector<int32_t> expected_data(n_ids*n_queries*n_lanes, -1);
+
+        const std::array<int32_t, n_queries> visible_lane_0 = { 0, 1, 3, 511, 512, 513, 1030, 1031 };
+        const std::array<int32_t, n_queries> visible_lane_1 = { 1031, 1030, 513, 512, 511, 3, 1, 0 };
+
+        auto key_value = [](int64_t block, int64_t query, int64_t lane) {
+            if ((query == 7 && lane == 0) || (query == 0 && lane == 1)) {
+                return 1.0f + (float) (block/2);
+            }
+
+            const int64_t shift = (73*query + 211*lane) % n_blocks;
+            const float value = (float) ((block + shift) % n_blocks);
+            if ((query == 6 && lane == 0) || (query == 1 && lane == 1)) {
+                return value - 515.0f;
+            }
+            return value + 1.0f;
+        };
+
+        for (int64_t lane = 0; lane < n_lanes; ++lane) {
+            for (int64_t query = 0; query < n_queries; ++query) {
+                for (int64_t head = 0; head < nh; ++head) {
+                    q_data[query*hsk*nh + head*hsk + query + lane*hsk*nh*n_queries] = 1.0f;
+                }
+                for (int64_t block = 0; block < n_blocks; ++block) {
+                    k_data[query + block*hsk + lane*hsk*n_blocks] = key_value(block, query, lane);
+                }
+            }
+
+            for (int64_t cell = 0; cell < n_block_cells; ++cell) {
+                block_cells_data[cell + lane*n_block_cells] = (int32_t) ((37*cell + 11 + 19*lane) % n_block_cells);
+            }
+
+            for (int64_t query = 0; query < n_queries; ++query) {
+                const int64_t row = query + lane*n_queries;
+                const int32_t n_visible = lane == 0 ? visible_lane_0[query] : visible_lane_1[query];
+                visible_data[row] = n_visible;
+
+                const int64_t n_tail = (query + 2*lane) % block_size;
+                for (int64_t member = 0; member < n_tail; ++member) {
+                    tail_data[member + (block_size - 1)*row] = (int32_t) (n_block_cells + member);
+                }
+
+                std::vector<std::pair<float, int32_t>> ranked;
+                ranked.reserve(n_visible);
+                for (int32_t block = 0; block < n_visible; ++block) {
+                    const float score = 4.0f*std::max(key_value(block, query, lane), 0.0f);
+                    ranked.emplace_back(score, block);
+                }
+                std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+                    return a.first != b.first ? a.first > b.first : a.second < b.second;
+                });
+
+                const int64_t n_selected = std::min<int64_t>(block_top_k, ranked.size());
+                for (int64_t selected = 0; selected < n_selected; ++selected) {
+                    const int32_t block = ranked[selected].second;
+                    for (int64_t member = 0; member < block_size; ++member) {
+                        expected_data[selected*block_size + member + n_ids*row] =
+                                block_cells_data[block*block_size + member + lane*n_block_cells];
+                    }
+                }
+                for (int64_t member = 0; member < block_size - 1; ++member) {
+                    expected_data[token_top_k + member + n_ids*row] = tail_data[member + (block_size - 1)*row];
+                }
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                ggml_backend_tensor_set(t, q_data.data(), 0, q_data.size()*sizeof(float));
+            } else if (strcmp(t->name, "k") == 0) {
+                ggml_backend_tensor_set(t, k_data.data(), 0, k_data.size()*sizeof(float));
+            } else if (strcmp(t->name, "block_cells") == 0) {
+                ggml_backend_tensor_set(t, block_cells_data.data(), 0, block_cells_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "visible") == 0) {
+                ggml_backend_tensor_set(t, visible_data.data(), 0, visible_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tail") == 0) {
+                ggml_backend_tensor_set(t, tail_data.data(), 0, tail_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "expected") == 0) {
+                ggml_backend_tensor_set(t, expected_data.data(), 0, expected_data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == 2*n_ids*n_queries*n_lanes);
+
+        double result = 0.0;
+        const size_t n_rows = n_queries*n_lanes;
+        for (size_t row = 0; row < n_rows; ++row) {
+            const float * a_selected = a + row*2*n_ids;
+            const float * a_expected = a_selected + n_ids;
+            const float * b_selected = b + row*2*n_ids;
+            const float * b_expected = b_selected + n_ids;
+            for (int64_t i = 0; i < n_ids; ++i) {
+                result = std::max(result, (double) fabsf(a_selected[i] - b_selected[i]));
+                result = std::max(result, (double) fabsf(a_selected[i] - a_expected[i]));
+                result = std::max(result, (double) fabsf(b_selected[i] - b_expected[i]));
+            }
+        }
+        return result;
     }
 };
 
@@ -10009,6 +10355,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 2, 2, 17, 3, 7, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(64, 64, 2, 2, 17, 3, 7, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 2, 12, 64, 3, 7, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 2, 12, 64, 3, 7, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 2, 12, 2051, 3, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_indexed(256, 256, 2, 12, 4097, 3, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true));
+
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
@@ -10177,6 +10530,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(1));
     test_cases.emplace_back(new test_falcon(2));
 #endif
+
+    test_cases.emplace_back(new test_qsa_indexer());
 
     // lightning_indexer
     for (int kv : { 256 }) {

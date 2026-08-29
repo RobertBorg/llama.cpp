@@ -1098,9 +1098,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FLASH_ATTN_EXT_INDEXED",
+    "QSA_INDEXER",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1213,9 +1216,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "flash_attn_ext_indexed(x)",
+    "qsa_indexer(q, k, block_cells, visible, tail)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5492,11 +5498,47 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_indexed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * indices,
+        float                 scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[1] == q->ne[1]);
+    GGML_ASSERT(indices->ne[2] == 1);
+    GGML_ASSERT(indices->ne[3] == q->ne[3]);
+
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    const float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_INDEXED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = indices;
+
+    return result;
+}
+
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -5505,7 +5547,7 @@ void ggml_flash_attn_ext_set_prec(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
@@ -6395,6 +6437,62 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_qsa_indexer
+
+struct ggml_tensor * ggml_qsa_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * block_cells,
+        struct ggml_tensor  * visible,
+        struct ggml_tensor  * tail,
+        int32_t               block_size,
+        int32_t               token_top_k) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(visible->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(token_top_k > 0 && token_top_k % block_size == 0);
+    GGML_ASSERT(token_top_k/block_size <= k->ne[1]);
+
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[2] == 1);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+
+    GGML_ASSERT(block_cells->ne[0] == block_size*k->ne[1]);
+    GGML_ASSERT(block_cells->ne[1] == 1);
+    GGML_ASSERT(block_cells->ne[2] == 1);
+    GGML_ASSERT(block_cells->ne[3] == q->ne[3]);
+
+    GGML_ASSERT(visible->ne[0] == 1);
+    GGML_ASSERT(visible->ne[1] == q->ne[2]);
+    GGML_ASSERT(visible->ne[2] == 1);
+    GGML_ASSERT(visible->ne[3] == q->ne[3]);
+
+    GGML_ASSERT(tail->ne[0] == MAX(1, block_size - 1));
+    GGML_ASSERT(tail->ne[1] == q->ne[2]);
+    GGML_ASSERT(tail->ne[2] == 1);
+    GGML_ASSERT(tail->ne[3] == q->ne[3]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_I32, token_top_k + block_size - 1, q->ne[2], 1, q->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, block_size);
+    ggml_set_op_params_i32(result, 1, token_top_k);
+
+    result->op     = GGML_OP_QSA_INDEXER;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = block_cells;
+    result->src[3] = visible;
+    result->src[4] = tail;
 
     return result;
 }

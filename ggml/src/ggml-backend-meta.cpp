@@ -800,6 +800,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     };
 
+    auto handle_qsa_indexer = [&](
+            const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < 5; ++i) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    };
+
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
@@ -850,6 +858,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } else if (ret.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 GGML_ASSERT(ret.n_segments == 1);
                 GGML_ASSERT(ret.nr[0] == 1);
+            }
+            if (n_bufs == 1 && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
+                return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             }
             return ret;
         }
@@ -1011,7 +1022,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FILL: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
-            case GGML_OP_FLASH_ATTN_EXT: {
+            case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_FLASH_ATTN_EXT_INDEXED: {
                 split_state = handle_flash_attn_ext(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_BACK: {
@@ -1036,6 +1048,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
+            } break;
+            case GGML_OP_QSA_INDEXER: {
+                split_state = handle_qsa_indexer(src_ss);
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:

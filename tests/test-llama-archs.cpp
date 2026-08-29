@@ -10,6 +10,7 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-context.h"
+#include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 #include "../src/llama-moe-stream.h"
@@ -430,7 +431,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1,
-        bool kv_unified = false, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
+        bool kv_unified = false, ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr,
+        enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO, ggml_type type_v = GGML_TYPE_F16) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -447,6 +449,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     ctx_params.cb_eval = cb_eval;
     ctx_params.cb_eval_user_data = cb_eval_user_data;
+    ctx_params.flash_attn_type = flash_attn_type;
+    ctx_params.type_v = type_v;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -585,10 +589,72 @@ static void test_qwen4exp_qsa_non_causal() {
     GGML_ASSERT(changed);
 }
 
+static void test_qwen4exp_qsa_ratio_one() {
+    constexpr size_t seed = 3321213324;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    const std::string key = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_ATTENTION_COMPRESS_RATIOS);
+    const int64_t key_id = gguf_find_key(gguf_ctx.get(), key.c_str());
+    GGML_ASSERT(key_id >= 0);
+
+    const size_t n_ratios = gguf_get_arr_n(gguf_ctx.get(), key_id);
+    const std::vector<uint32_t> ratios(n_ratios, 1);
+    gguf_set_arr_data(gguf_ctx.get(), key.c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(8, 128, seed));
+}
+
+static void test_qwen4exp_qsa_indexer_cache_memory() {
+    constexpr size_t seed = 3321213324;
+
+    auto load = [&](ggml_type type_v) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        return get_model_and_ctx(
+                gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false, nullptr, nullptr,
+                LLAMA_FLASH_ATTN_TYPE_AUTO, type_v);
+    };
+
+    auto f16 = load(GGML_TYPE_F16);
+    auto f32 = load(GGML_TYPE_F32);
+
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(f16.second.get()));
+    GGML_ASSERT(memory != nullptr);
+    GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_COUNT);
+
+    auto context_bytes = [](const llama_context * lctx) {
+        size_t result = 0;
+        for (const auto & [buft, data] : lctx->memory_breakdown()) {
+            GGML_UNUSED(buft);
+            result += data.context;
+        }
+        return result;
+    };
+
+    const llama_hparams & hparams = f16.first->hparams;
+    size_t expected = 0;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (!hparams.is_recr(il)) {
+            expected += (size_t) llama_n_ctx(f16.second.get())*hparams.n_embd_v_gqa(il)*(sizeof(float) - sizeof(ggml_fp16_t));
+        }
+    }
+
+    const size_t actual = context_bytes(f32.second.get()) - context_bytes(f16.second.get());
+    if (actual != expected) {
+        fprintf(stderr, "Qwen4Exp QSA regression: changing V cache F16 -> F32 added %.2f KiB, expected %.2f KiB\n",
+                actual/1024.0, expected/1024.0);
+    }
+    GGML_ASSERT(actual == expected);
+}
+
 struct qwen4exp_qsa_capture {
     int64_t n_blocks = 0;
     int64_t query = -1;
     int64_t selected = -1;
+    int64_t ids_width = 0;
+    bool compact_ids_seen = false;
+    bool dense_mask_seen = false;
+    bool raw_key_seen = false;
     int64_t pooled_norm_shape[4] = {};
     std::vector<int32_t> block_pos;
     ggml_type pooled_type = GGML_TYPE_COUNT;
@@ -628,13 +694,17 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
     const bool old_selection = capture->selected < 0 && capture->query >= 0 &&
         tensor->op == GGML_OP_SET_ROWS && tensor->src[1] != nullptr &&
         strncmp(tensor->src[1]->name, "indexer_top_k-", strlen("indexer_top_k-")) == 0;
-    const bool qsa_mask = capture->selected < 0 && capture->query >= 0 &&
+    const bool qsa_mask = !capture->dense_mask_seen && capture->query >= 0 &&
         strncmp(tensor->name, "qsa_mask-", strlen("qsa_mask-")) == 0;
+    const bool qsa_ids = !capture->compact_ids_seen && capture->query >= 0 &&
+        strncmp(tensor->name, "qsa_ids-", strlen("qsa_ids-")) == 0;
+    const bool raw_key = !capture->raw_key_seen &&
+        strncmp(tensor->name, "indexer_k_raw-", strlen("indexer_k_raw-")) == 0;
     const bool pooled_keys = capture->pooled_keys.empty() &&
         strncmp(tensor->name, "indexer_k_pooled-", strlen("indexer_k_pooled-")) == 0;
 
     if (ask) {
-        return pooled_norm || block_pos || old_selection || qsa_mask || pooled_keys;
+        return pooled_norm || block_pos || old_selection || qsa_mask || qsa_ids || raw_key || pooled_keys;
     }
 
     if (pooled_norm) {
@@ -660,6 +730,28 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
         }
     }
 
+    if (qsa_mask) {
+        capture->dense_mask_seen = true;
+    }
+
+    if (qsa_ids) {
+        GGML_ASSERT(tensor->type == GGML_TYPE_I32);
+        GGML_ASSERT(capture->query < tensor->ne[1]);
+        std::vector<int32_t> data(ggml_nelements(tensor));
+        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
+
+        capture->selected = 0;
+        capture->ids_width = tensor->ne[0];
+        capture->compact_ids_seen = true;
+        for (int64_t j = 0; j < tensor->ne[0]; ++j) {
+            capture->selected += data[j + capture->query*tensor->ne[0]] >= 0;
+        }
+    }
+
+    if (raw_key) {
+        capture->raw_key_seen = true;
+    }
+
     if (pooled_keys) {
         std::vector<uint8_t> data(ggml_nbytes(tensor));
         ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
@@ -678,6 +770,80 @@ static bool qwen4exp_qsa_capture_cb(ggml_tensor * tensor, bool ask, void * user_
     }
 
     return true;
+}
+
+static void test_qwen4exp_qsa_no_flash_attn() {
+    constexpr size_t seed = 3321213324;
+    constexpr size_t n_tokens = 8;
+
+    qwen4exp_qsa_capture capture;
+    capture.query = n_tokens - 1;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture, LLAMA_FLASH_ATTN_TYPE_DISABLED);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(n_tokens, 128, seed));
+
+    GGML_ASSERT(capture.dense_mask_seen);
+    GGML_ASSERT(!capture.compact_ids_seen);
+}
+
+static void test_qwen4exp_qsa_short_context_bypass() {
+    constexpr size_t seed = 3321213324;
+    constexpr size_t n_tokens = 8;
+
+    qwen4exp_qsa_capture capture;
+    capture.query = n_tokens - 1;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    const std::string key = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_ATTENTION_INDEXER_TOP_K);
+    GGML_ASSERT(gguf_find_key(gguf_ctx.get(), key.c_str()) >= 0);
+    gguf_set_val_u32(gguf_ctx.get(), key.c_str(), 256);
+    gguf_set_val_u32(gguf_ctx.get(), LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_CONTEXT_LENGTH).c_str(), 512);
+
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(n_tokens, 128, seed));
+
+    GGML_ASSERT(capture.raw_key_seen);
+    GGML_ASSERT(!capture.dense_mask_seen);
+    GGML_ASSERT(!capture.compact_ids_seen);
+}
+
+static void test_qwen4exp_qsa_sparse_crossover() {
+    constexpr size_t seed = 3321213324;
+
+    qwen4exp_qsa_capture capture;
+    capture.query = 63;
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    const std::string key = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_ATTENTION_INDEXER_TOP_K);
+    GGML_ASSERT(gguf_find_key(gguf_ctx.get(), key.c_str()) >= 0);
+    gguf_set_val_u32(gguf_ctx.get(), key.c_str(), 16);
+    gguf_set_val_u32(gguf_ctx.get(), LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_CONTEXT_LENGTH).c_str(), 512);
+
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+            qwen4exp_qsa_capture_cb, &capture);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(64, 128, seed));
+    GGML_ASSERT(capture.dense_mask_seen);
+    GGML_ASSERT(!capture.compact_ids_seen);
+
+    capture = {};
+    capture.query = 63;
+    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(320, 128, seed + 1));
+    GGML_ASSERT(capture.compact_ids_seen);
+
+    capture = {};
+    capture.query = 63;
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(model_and_ctx.second.get()), 0, -1, -1));
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(64, 128, seed + 2));
+    GGML_ASSERT(capture.raw_key_seen);
+    GGML_ASSERT(capture.dense_mask_seen);
+    GGML_ASSERT(!capture.compact_ids_seen);
 }
 
 static void test_qwen4exp_qsa_norm_layout() {
@@ -746,7 +912,7 @@ static std::vector<int32_t> get_qwen4exp_qsa_block_pos() {
     return capture.block_pos;
 }
 
-static int64_t get_qwen4exp_qsa_selected_count() {
+static qwen4exp_qsa_capture get_qwen4exp_qsa_selection() {
     constexpr size_t seed = 3321213324;
     constexpr uint32_t n_tokens = 14;
 
@@ -757,12 +923,13 @@ static int64_t get_qwen4exp_qsa_selected_count() {
     auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
             qwen4exp_qsa_capture_cb, &capture);
     get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(n_tokens, 128, seed));
-    return capture.selected;
+    return capture;
 }
 
 static void test_qwen4exp_qsa_block_semantics() {
     const std::vector<int32_t> block_pos = get_qwen4exp_qsa_block_pos();
-    const int64_t selected = get_qwen4exp_qsa_selected_count();
+    const qwen4exp_qsa_capture selection = get_qwen4exp_qsa_selection();
+    const int64_t selected = selection.selected;
     const int64_t n_blocks = 64;
 
     const bool positions_ok = block_pos.size() == 4*n_blocks &&
@@ -771,12 +938,15 @@ static void test_qwen4exp_qsa_block_semantics() {
         block_pos[2*n_blocks] == 0 && block_pos[2*n_blocks + 1] == 0 &&
         block_pos[3*n_blocks] == 0 && block_pos[3*n_blocks + 1] == 0;
 
-    if (!positions_ok || selected != 10) {
-        fprintf(stderr, "Qwen4Exp QSA regression: block positions %s, selected=%" PRId64 "\n",
-                positions_ok ? "OK" : "incorrect", selected);
+    const bool compact_ok = selection.compact_ids_seen && !selection.dense_mask_seen && selection.ids_width == 11;
+    if (!positions_ok || selected != 10 || !compact_ok) {
+        fprintf(stderr, "Qwen4Exp QSA regression: block positions %s, selected=%" PRId64 ", compact=%d, dense_mask=%d, ids_width=%" PRId64 "\n",
+                positions_ok ? "OK" : "incorrect", selected, selection.compact_ids_seen,
+                selection.dense_mask_seen, selection.ids_width);
     }
     GGML_ASSERT(positions_ok);
     GGML_ASSERT(selected == 10);
+    GGML_ASSERT(compact_ok);
 }
 
 static void test_qwen4exp_qsa_pool_precision() {
@@ -954,7 +1124,59 @@ static void test_qwen4exp_unified_prefix_state() {
     std::vector<uint8_t> state(state_size);
     GGML_ASSERT(llama_state_seq_get_data(lctx, state.data(), state.size(), 0) == state.size());
 
+    uint32_t state_magic;
+    uint32_t state_version;
+    memcpy(&state_magic,   state.data() + 2*sizeof(uint32_t), sizeof(state_magic));
+    memcpy(&state_version, state.data() + 3*sizeof(uint32_t), sizeof(state_version));
+    GGML_ASSERT(state_magic == 0x58444951 && state_version == 1);
+
+    const llama_state_seq_flags device_flags = LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    const size_t device_state_size = llama_state_seq_get_size_ext(lctx, 0, device_flags);
+    GGML_ASSERT(device_state_size > 0);
+    std::vector<uint8_t> device_state(device_state_size);
+    GGML_ASSERT(llama_state_seq_get_data_ext(lctx, device_state.data(), device_state.size(), 0, device_flags) == device_state.size());
+
     const std::vector<float> expected = get_logits(model, lctx, replay, false, 0, n_saved);
+
+    std::vector<uint8_t> device_state_padded = device_state;
+    device_state_padded.push_back(0xa5);
+    llama_memory_clear(memory, true);
+    GGML_ASSERT(llama_state_seq_set_data_ext(lctx, device_state_padded.data(), device_state_padded.size(), 2, device_flags) == device_state.size());
+    const std::vector<float> padded = get_logits(model, lctx, replay, false, 2, n_saved);
+    GGML_ASSERT(padded == expected);
+
+    auto * hybrid_idx = dynamic_cast<llama_memory_hybrid_idx *>(memory);
+    GGML_ASSERT(hybrid_idx != nullptr);
+    const std::vector<uint32_t> attn_layers = hybrid_idx->get_mem_attn()->get_layer_ids();
+    GGML_ASSERT(!attn_layers.empty());
+    ggml_tensor * k_probe = hybrid_idx->get_mem_attn()->get_k_storage(attn_layers.front());
+    std::vector<uint8_t> sentinel(ggml_nbytes(k_probe), 0xa5);
+    llama_memory_clear(memory, true);
+    ggml_backend_tensor_set(k_probe, sentinel.data(), 0, sentinel.size());
+
+    std::vector<uint8_t> corrupt_device_late = device_state;
+    corrupt_device_late.back() ^= 0x80;
+    GGML_ASSERT(llama_state_seq_set_data_ext(lctx, corrupt_device_late.data(), corrupt_device_late.size(), 2, device_flags) == 0);
+    std::vector<uint8_t> probe_after(sentinel.size());
+    ggml_backend_tensor_get(k_probe, probe_after.data(), 0, probe_after.size());
+    GGML_ASSERT(probe_after == sentinel);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, 2) == -1);
+
+    std::vector<uint8_t> corrupt = state;
+    corrupt[2*sizeof(uint32_t)] ^= 1;
+    llama_memory_clear(memory, true);
+    GGML_ASSERT(llama_state_seq_set_data(lctx, corrupt.data(), corrupt.size(), 2) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, 2) == -1);
+
+    llama_memory_clear(memory, true);
+    GGML_ASSERT(llama_state_seq_set_data_ext(lctx, state.data(), state.size(), 2, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, 2) == -1);
+
+    std::vector<uint8_t> corrupt_device = device_state;
+    corrupt_device[2*sizeof(uint32_t)] ^= 1;
+    llama_memory_clear(memory, true);
+    GGML_ASSERT(llama_state_seq_set_data_ext(lctx, corrupt_device.data(), corrupt_device.size(), 2, device_flags) == 0);
+    GGML_ASSERT(llama_memory_seq_pos_max(memory, 2) == -1);
 
     llama_memory_clear(memory, true);
     get_logits(model, lctx, get_tokens(3, n_vocab, seed + 1));
@@ -1863,6 +2085,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_unified_prefix_state();
         test_qwen4exp_qsa_unified_sequences();
         test_qwen4exp_qsa_non_causal();
+        test_qwen4exp_qsa_ratio_one();
+        test_qwen4exp_qsa_no_flash_attn();
+        test_qwen4exp_qsa_short_context_bypass();
+        test_qwen4exp_qsa_sparse_crossover();
+        test_qwen4exp_qsa_indexer_cache_memory();
         test_qwen4exp_qsa_norm_layout();
         test_qwen4exp_qsa_block_semantics();
         test_qwen4exp_qsa_pool_precision();

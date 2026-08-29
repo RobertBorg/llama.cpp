@@ -15,6 +15,10 @@
 // llama_memory_hybrid_idx
 //
 
+static constexpr uint32_t HYBRID_IDX_STATE_MAGIC        = 0x58444951; // QIDX
+static constexpr uint32_t HYBRID_IDX_STATE_VERSION      = 1;
+static constexpr uint32_t HYBRID_IDX_STATE_MODE_FULL    = 0;
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -55,7 +59,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", true);
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -197,11 +201,21 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    if (!partial_only) {
+        const uint32_t magic   = HYBRID_IDX_STATE_MAGIC;
+        const uint32_t version = HYBRID_IDX_STATE_VERSION;
+        const uint32_t mode    = HYBRID_IDX_STATE_MODE_FULL;
+
+        io.write(&magic,   sizeof(magic));
+        io.write(&version, sizeof(version));
+        io.write(&mode,    sizeof(mode));
+    }
+
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
-    // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    if (!partial_only) {
         if (mem_idx) {
             mem_idx->state_write(io, seq_id, flags);
         }
@@ -219,14 +233,34 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
     try {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        if (!partial_only) {
+            uint32_t magic;
+            uint32_t version;
+            uint32_t mode;
+
+            io.read(&magic,   sizeof(magic));
+            io.read(&version, sizeof(version));
+            io.read(&mode,    sizeof(mode));
+
+            if (magic != HYBRID_IDX_STATE_MAGIC) {
+                throw std::runtime_error("hybrid indexer state magic mismatch");
+            }
+            if (version != HYBRID_IDX_STATE_VERSION) {
+                throw std::runtime_error("hybrid indexer state version mismatch");
+            }
+            if (mode != HYBRID_IDX_STATE_MODE_FULL) {
+                throw std::runtime_error("hybrid indexer state mode mismatch");
+            }
+        }
+
+        if (!partial_only) {
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
         get_mem_recr()->state_read(io, seq_id, flags);
 
-        // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (!partial_only) {
             if (mem_idx) {
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
             }
@@ -346,6 +380,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * blk_bias,
+        ggml_tensor * visible_blocks,
         ggml_tensor * tail_cells,
         const llama_ubatch * ubatch,
         uint32_t ratio,
@@ -353,11 +388,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_lane   = cell_blk->ne[1];
+    const bool sparse      = visible_blocks != nullptr;
+    const int64_t n_lane   = sparse ? blk_cells->ne[3] : blk_cells->ne[1];
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_lane);
+    const int64_t n_kv     = get_idx()->get_n_kv();
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_tps    = ubatch->n_seq_tokens;
     const int64_t r        = ratio;
@@ -366,14 +402,26 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(ubatch->equal_seqs());
     GGML_ASSERT(n_lane == ubatch->n_seqs);
     GGML_ASSERT(n_tokens == n_tps*n_lane);
-    GGML_ASSERT(blk_cells->ne[0] == r*n_blocks && blk_cells->ne[1] == n_lane);
-    GGML_ASSERT(blk_bias->ne[0] == n_blocks && blk_bias->ne[1] == n_tps && blk_bias->ne[2] == n_lane);
-    GGML_ASSERT(tail_cells->ne[0] == tail_cap && tail_cells->ne[1] == n_tps && tail_cells->ne[2] == n_lane);
+    GGML_ASSERT(blk_cells->ne[0] == r*n_blocks);
+    GGML_ASSERT((cell_blk == nullptr) == sparse);
+    GGML_ASSERT((blk_bias == nullptr) == sparse);
+    if (sparse) {
+        GGML_ASSERT(blk_cells->ne[1] == 1 && blk_cells->ne[2] == 1);
+        GGML_ASSERT(visible_blocks->ne[0] == 1 && visible_blocks->ne[1] == n_tps && visible_blocks->ne[2] == 1 && visible_blocks->ne[3] == n_lane);
+        GGML_ASSERT(tail_cells->ne[0] == tail_cap && tail_cells->ne[1] == n_tps && tail_cells->ne[2] == 1 && tail_cells->ne[3] == n_lane);
+    } else {
+        GGML_ASSERT(visible_blocks == nullptr);
+        GGML_ASSERT(cell_blk->ne[0] == n_kv && cell_blk->ne[1] == n_lane);
+        GGML_ASSERT(blk_cells->ne[1] == n_lane);
+        GGML_ASSERT(blk_bias->ne[0] == n_blocks && blk_bias->ne[1] == n_tps && blk_bias->ne[2] == n_lane);
+        GGML_ASSERT(tail_cells->ne[0] == tail_cap && tail_cells->ne[1] == n_tps && tail_cells->ne[2] == n_lane);
+    }
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_blk_bias  = (float   *) blk_bias->data;
+    float   * dst_blk_bias  = blk_bias ? (float *) blk_bias->data : nullptr;
+    int32_t * dst_visible   = visible_blocks ? (int32_t *) visible_blocks->data : nullptr;
     int32_t * dst_tail      = (int32_t *) tail_cells->data;
 
     std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_lane, 0);
@@ -382,7 +430,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_seq_id seq_of_lane = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_lane);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
         std::vector<uint32_t> ordered;
         ordered.reserve(n_kv);
@@ -412,7 +460,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         });
 
         const int32_t safe_cell = ordered.empty() ? 0 : (int32_t) ordered[0];
-        std::fill(cur_cell_blk, cur_cell_blk + n_kv, (int32_t) n_blocks);
+        if (cur_cell_blk) {
+            std::fill(cur_cell_blk, cur_cell_blk + n_kv, (int32_t) n_blocks);
+        }
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, safe_cell);
 
         const int64_t n_complete = ordered.size()/r;
@@ -423,7 +473,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             const int64_t b = rank/r;
             const int64_t member = rank % r;
 
-            cur_cell_blk[cell] = (int32_t) b;
+            if (cur_cell_blk) {
+                cur_cell_blk[cell] = (int32_t) b;
+            }
             cur_blk_cells[b*r + member] = (int32_t) cell;
 
             if (member == 0) {
@@ -453,15 +505,19 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 }
             }
 
-            float * cur_bias = dst_blk_bias + i*n_blocks;
             const int64_t n_visible_blocks = n_visible/r;
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                cur_bias[b] = b < n_visible_blocks ? 0.0f : -INFINITY;
+            if (dst_visible) {
+                dst_visible[i] = (int32_t) n_visible_blocks;
+            } else {
+                float * cur_bias = dst_blk_bias + i*n_blocks;
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    cur_bias[b] = b < n_visible_blocks ? 0.0f : -INFINITY;
+                }
             }
 
             int32_t * cur_tail = dst_tail + i*tail_cap;
             for (int64_t j = 0; j < tail_cap; ++j) {
-                cur_tail[j] = (int32_t) (n_kv + j);
+                cur_tail[j] = sparse ? -1 : (int32_t) (n_kv + j);
             }
             const int64_t n_tail = n_visible % r;
             for (int64_t j = 0; j < n_tail; ++j) {
