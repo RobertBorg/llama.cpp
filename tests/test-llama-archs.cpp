@@ -125,12 +125,12 @@ static void test_qwen4exp_ple_metadata_save() {
     GGML_ASSERT(chat_template == gguf_get_val_str(saver.gguf_ctx, chat_template_key_id));
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool ple = false) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool ple = false, const bool nextn = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
 
-    GGML_ASSERT(!ple || arch == LLM_ARCH_QWEN4EXP);
+    GGML_ASSERT((!ple && !nextn) || arch == LLM_ARCH_QWEN4EXP);
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -191,7 +191,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    const uint32_t n_layer_all = n_layer + (nextn ? 1 : 0);
+
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer_all);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -301,7 +303,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        std::vector<uint32_t> compress_ratios(n_layer, 4);
+        if (nextn) {
+            compress_ratios.push_back(0);
+            ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+        }
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
 
         if (ple) {
             ms.add_kv(LLM_KV_PLE_LAYERS,            std::vector<uint32_t>{0});
@@ -1520,6 +1527,134 @@ static void test_qwen4exp_moe_stream_exact() {
     GGML_ASSERT(stream->stats.n_miss > stream->stats.n_miss_cold);
 }
 
+static void test_qwen4exp_mtp_decode() {
+    const size_t seed = 0x4d5450;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, false, true);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model != nullptr);
+    GGML_ASSERT(llama_model_n_layer(model.get()) == 2);
+    GGML_ASSERT(llama_model_n_layer_nextn(model.get()) == 1);
+
+    llama_context_params target_params = llama_context_default_params();
+    target_params.n_ctx = 64;
+    target_params.n_batch = 4;
+    target_params.n_ubatch = 4;
+    target_params.n_threads = 4;
+    target_params.n_threads_batch = 4;
+
+    llama_context_ptr target(llama_init_from_model(model.get(), target_params));
+    GGML_ASSERT(target != nullptr);
+    target->set_embeddings_nextn(true, false);
+
+    llama_token prompt_token = 1;
+    llama_batch prompt = llama_batch_get_one(&prompt_token, 1);
+    GGML_ASSERT(llama_decode(target.get(), prompt) == 0);
+
+    const int32_t n_embd_out = llama_model_n_embd_out(model.get());
+    const float * target_hidden = target->get_embeddings_nextn_ith(0);
+    GGML_ASSERT(target_hidden != nullptr);
+    std::vector<float> hidden(target_hidden, target_hidden + n_embd_out);
+
+    auto decode_mtp = [&](llama_model * mtp_model) {
+        llama_context_params mtp_params = target_params;
+        mtp_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        mtp_params.ctx_other = target.get();
+
+        llama_context_ptr mtp(llama_init_from_model(mtp_model, mtp_params));
+        GGML_ASSERT(mtp != nullptr);
+        mtp->set_embeddings_nextn(true, true);
+
+        llama_token next_token = 2;
+        llama_pos pos = 1;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq_id = 0;
+        llama_seq_id * seq_ids = &seq_id;
+        int8_t output = 1;
+        llama_batch draft = {
+            /*.n_tokens =*/ 1,
+            /*.token    =*/ &next_token,
+            /*.embd     =*/ hidden.data(),
+            /*.pos      =*/ &pos,
+            /*.n_seq_id =*/ &n_seq_id,
+            /*.seq_id   =*/ &seq_ids,
+            /*.logits   =*/ &output,
+        };
+
+        GGML_ASSERT(llama_decode(mtp.get(), draft) == 0);
+        const float * logits = llama_get_logits_ith(mtp.get(), 0);
+        const float * draft_hidden = mtp->get_embeddings_nextn_ith(0);
+        GGML_ASSERT(logits != nullptr && draft_hidden != nullptr);
+
+        std::vector<float> logits_out(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(mtp_model)));
+        std::vector<float> hidden_out(draft_hidden, draft_hidden + n_embd_out);
+        GGML_ASSERT(std::all_of(logits_out.begin(), logits_out.end(), [](float value) {
+            return std::isfinite(value);
+        }));
+        GGML_ASSERT(std::all_of(hidden_out.begin(), hidden_out.end(), [](float value) {
+            return std::isfinite(value);
+        }));
+        return std::make_pair(std::move(logits_out), std::move(hidden_out));
+    };
+
+    const auto expected = decode_mtp(model.get());
+
+    const std::string path = (std::filesystem::temp_directory_path()/
+            ("llama-qwen4exp-mtp-" + std::to_string(ggml_time_us()) + ".gguf")).string();
+    struct cleanup_file {
+        const std::string & path;
+        ~cleanup_file() { std::remove(path.c_str()); }
+    } cleanup { path };
+
+    llama_model_saver full(model.get());
+    full.add_kv_from_model();
+    gguf_context_ptr detached_gguf(gguf_init_empty());
+    gguf_set_kv(detached_gguf.get(), full.gguf_ctx);
+    const std::string recurrent_key = LLM_KV(LLM_ARCH_QWEN4EXP)(LLM_KV_ATTENTION_RECURRENT_LAYERS);
+    const bool recurrent_layers[] = { true, true, false };
+    gguf_set_arr_data(detached_gguf.get(), recurrent_key.c_str(), GGUF_TYPE_BOOL, recurrent_layers, 3);
+
+    const LLM_TN tn(LLM_ARCH_QWEN4EXP);
+    const std::string mtp_prefix = "blk.2.";
+    const std::map<std::string, std::string> mixer_names = {
+        { tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", 2), tn(LLM_TENSOR_HC_HEAD_NORM, "weight") },
+        { tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", 2), tn(LLM_TENSOR_HC_HEAD_DOWN, "weight") },
+        { tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", 2), tn(LLM_TENSOR_HC_HEAD_UP,   "weight") },
+    };
+    int n_mtp_tensors = 0;
+    for (const auto & [name, tensor] : llama_internal_get_tensor_map(model.get())) {
+        if (name == tn(LLM_TENSOR_TOKEN_EMBD, "weight") || name == tn(LLM_TENSOR_OUTPUT, "weight")) {
+            gguf_add_tensor(detached_gguf.get(), tensor);
+        } else if (name.rfind(mtp_prefix, 0) == 0) {
+            const auto renamed = mixer_names.find(name);
+            if (renamed == mixer_names.end()) {
+                gguf_add_tensor(detached_gguf.get(), tensor);
+            } else {
+                ggml_tensor copy = *tensor;
+                ggml_set_name(&copy, renamed->second.c_str());
+                gguf_add_tensor(detached_gguf.get(), &copy);
+            }
+            ++n_mtp_tensors;
+        }
+    }
+    GGML_ASSERT(n_mtp_tensors > 0);
+    gguf_write_to_file(detached_gguf.get(), path.c_str(), false);
+
+    llama_model_ptr detached(llama_model_load_from_file(path.c_str(), model_params));
+    GGML_ASSERT(detached != nullptr);
+    GGML_ASSERT(llama_model_n_layer(detached.get()) == 2);
+    GGML_ASSERT(llama_model_n_layer_nextn(detached.get()) == 1);
+    GGML_ASSERT(detached->layers[0].hc_attn_norm == nullptr);
+
+    const auto actual = decode_mtp(detached.get());
+    GGML_ASSERT(expected == actual);
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1584,6 +1719,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_qsa_norm_layout();
         test_qwen4exp_qsa_block_semantics();
         test_qwen4exp_qsa_pool_precision();
+        test_qwen4exp_mtp_decode();
         test_qwen4exp_moe_stream_exact();
     }
 

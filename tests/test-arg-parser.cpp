@@ -95,10 +95,21 @@ static void test(void) {
         common_params base;
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
+        base.moe_stream = true;
+        base.moe_stream_slots = 39;
+        base.moe_stream_budget = 4ull*1024*1024*1024;
+        base.moe_stream_io_threads = 3;
+        base.moe_stream_direct = true;
+        base.speculative.draft.mparams.path = "draft.gguf";
 
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
+        assert(!draft.moe_stream);
+        assert(draft.moe_stream_slots == 0);
+        assert(draft.moe_stream_budget == 0);
+        assert(draft.moe_stream_io_threads == 0);
+        assert(!draft.moe_stream_direct);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
