@@ -197,6 +197,26 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+    if (GGML_METAL)
+        llama_test(
+            test-llama-archs
+            NAME test-qwen4exp-ple-metal
+            LABEL main
+            ARGS --test qwen4exp-ple-split-mrope-history --device MTL0
+        )
+        llama_test(
+            test-llama-archs
+            NAME test-qwen4exp-qsa-unified-metal
+            LABEL main
+            ARGS --test qwen4exp-qsa-unified-sequences --device MTL0
+        )
+        llama_test(
+            test-llama-archs
+            NAME test-qwen4exp-mtp-metal
+            LABEL main
+            ARGS --test qwen4exp-mtp-decode --device MTL0
+        )
+    endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -249,6 +269,18 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
         FAIL_REGULAR_EXPRESSION "skipping because n_rs_seq is disabled"
     )
+    if (GGML_METAL)
+        llama_test(
+            test-recurrent-state-rollback
+            NAME test-recurrent-state-rollback-qwen4exp-metal
+            LABEL main
+            ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" -dev MTL0 -ngl all
+        )
+        set_tests_properties(test-recurrent-state-rollback-qwen4exp-metal PROPERTIES
+            FIXTURES_REQUIRED generate-models
+            FAIL_REGULAR_EXPRESSION "skipping because n_rs_seq is disabled"
+        )
+    endif()
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
@@ -309,6 +341,107 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (GGML_METAL AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    llama_test(
+        test-backend-ops
+        NAME test-mul-mat-id-masked-metal
+        LABEL main
+        ARGS test -b MTL0 -o MUL_MAT_ID -p "^type_a=(iq3_xxs|iq4_nl|iq4_xs|q8_0),.*masked=1$"
+    )
+    set_tests_properties(test-mul-mat-id-masked-metal PROPERTIES
+        PASS_REGULAR_EXPRESSION "26/26 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-mul-mat-id-masked-disable-metal
+        LABEL main
+        ARGS test -b MTL0 -o MUL_MAT_ID -p "^type_a=(iq3_xxs|iq4_nl|iq4_xs|q8_0),.*masked=1$"
+    )
+    set_tests_properties(test-mul-mat-id-masked-disable-metal PROPERTIES
+        ENVIRONMENT "GGML_METAL_MUL_MAT_ID_MASKED_DISABLE=1"
+        PASS_REGULAR_EXPRESSION "0/0 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-indexer-metal
+        LABEL main
+        ARGS test -b MTL0 -o QSA_INDEXER
+    )
+    set_tests_properties(test-qsa-indexer-metal PROPERTIES
+        PASS_REGULAR_EXPRESSION "5/5 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-indexer-long-metal
+        LABEL main
+        ARGS test -b MTL0 -o QSA_INDEXER -p "^hsk=128,nh=4,n_blocks=65536,n_queries=8,n_lanes=2,block_size=4,token_top_k=2048,n_ids=2051$"
+    )
+    set_tests_properties(test-qsa-indexer-long-metal PROPERTIES
+        ENVIRONMENT "GGML_TEST_QSA_LONG=1"
+        PASS_REGULAR_EXPRESSION "1/1 tests passed"
+        TIMEOUT 300
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-indexer-tiled-long-metal
+        LABEL main
+        ARGS test -b MTL0 -o QSA_INDEXER -p "^hsk=128,nh=4,n_blocks=65536,n_queries=342,n_lanes=1,block_size=4,token_top_k=2048,n_ids=2051$"
+    )
+    set_tests_properties(test-qsa-indexer-tiled-long-metal PROPERTIES
+        ENVIRONMENT "GGML_TEST_QSA_LONG=1"
+        PASS_REGULAR_EXPRESSION "1/1 tests passed"
+        TIMEOUT 600
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-flash-attn-ext-indexed-q8-metal
+        LABEL main
+        ARGS test -b MTL0 -o FLASH_ATTN_EXT_INDEXED -p "^hsk=256,hsv=256,nh=2,nr2=12,kv=64,nq=3,n_ids=7,type_K=q8_0,type_V=q8_0,all_invalid=0,all_ids=0,scattered_ids=0$"
+    )
+    set_tests_properties(test-flash-attn-ext-indexed-q8-metal PROPERTIES
+        PASS_REGULAR_EXPRESSION "1/1 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-flash-attn-ext-indexed-q8-long-metal
+        LABEL main
+        ARGS test -b MTL0 -o FLASH_ATTN_EXT_INDEXED -p "^hsk=256,hsv=256,nh=1,nr2=12,kv=262144,nq=1,n_ids=2051,type_K=q8_0,type_V=q8_0,all_invalid=0,all_ids=0,scattered_ids=1$"
+    )
+    set_tests_properties(test-flash-attn-ext-indexed-q8-long-metal PROPERTIES
+        ENVIRONMENT "GGML_TEST_QSA_LONG=1"
+        PASS_REGULAR_EXPRESSION "1/1 tests passed"
+        TIMEOUT 300
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-indexed-attn-metal
+        LABEL main
+        ARGS test -b MTL0 -o FLASH_ATTN_EXT_INDEXED -p "^chain=1,n_blocks=1031,nq=3,nseq=2,n_ids=2051$"
+    )
+    set_tests_properties(test-qsa-indexed-attn-metal PROPERTIES
+        PASS_REGULAR_EXPRESSION "1/1 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-disable-metal
+        LABEL main
+        ARGS test -b MTL0 -o QSA_INDEXER
+    )
+    set_tests_properties(test-qsa-disable-metal PROPERTIES
+        ENVIRONMENT "GGML_METAL_QSA_DISABLE=1"
+        PASS_REGULAR_EXPRESSION "0/0 tests passed"
+    )
+    llama_test(
+        test-backend-ops
+        NAME test-qsa-indexed-attn-disable-metal
+        LABEL main
+        ARGS test -b MTL0 -o FLASH_ATTN_EXT_INDEXED -p "^hsk=256,hsv=256,nh=2,nr2=12,kv=64,nq=3,n_ids=7,type_K=q8_0,type_V=q8_0,all_invalid=0,all_ids=0,scattered_ids=0$"
+    )
+    set_tests_properties(test-qsa-indexed-attn-disable-metal PROPERTIES
+        ENVIRONMENT "GGML_METAL_QSA_DISABLE=1"
+        PASS_REGULAR_EXPRESSION "0/0 tests passed"
+    )
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

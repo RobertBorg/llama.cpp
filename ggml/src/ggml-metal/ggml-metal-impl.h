@@ -115,12 +115,28 @@
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
+#define OP_FLASH_ATTN_EXT_INDEXED_D          256
+#define OP_FLASH_ATTN_EXT_INDEXED_GQA         12
+#define OP_FLASH_ATTN_EXT_INDEXED_MAX_IDS   2051
+#define OP_FLASH_ATTN_EXT_INDEXED_NTHREADS   384
+#define OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT   16
+
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NH     64
 #define OP_LIGHTNING_INDEXER_NHPTG   8
 #define OP_LIGHTNING_INDEXER_NKPSG   8
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
+
+#define OP_QSA_INDEXER_D           128
+#define OP_QSA_INDEXER_NH            4
+#define OP_QSA_INDEXER_BLOCK_SIZE    4
+#define OP_QSA_INDEXER_TOKEN_TOP_K 2048
+#define OP_QSA_INDEXER_BLOCK_TOP_K  512
+#define OP_QSA_INDEXER_N_IDS       2051
+#define OP_QSA_INDEXER_NBPTG        64
+#define OP_QSA_INDEXER_NTHREADS     256
+#define OP_QSA_INDEXER_MAX_SCRATCH  268435456
 
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
@@ -433,6 +449,30 @@ typedef struct {
     uint64_t nb02;
     uint64_t nb03;
     int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne22;
+    int32_t  ne23;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne30;
+    uint64_t nb31;
+    uint64_t nb33;
+    float    scale;
+} ggml_metal_kargs_flash_attn_ext_indexed;
+
+typedef struct {
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
     int32_t  ne_12_2; // assume K and V are same shape
     int32_t  ne_12_3;
     int32_t  ns10;
@@ -575,6 +615,7 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    int32_t  masked;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
@@ -1200,6 +1241,7 @@ typedef struct {
 
 typedef struct {
     int64_t val;
+    uint64_t ne;
 } ggml_metal_kargs_memset;
 
 typedef struct {
@@ -1218,6 +1260,28 @@ typedef struct {
     uint64_t nbm1;
     uint64_t nbm3;
 } ggml_metal_kargs_lightning_indexer;
+
+typedef struct {
+    int32_t  n_blocks;
+    int32_t  n_queries;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    uint64_t nbk1;
+    uint64_t nbk3;
+    uint64_t nbv1;
+    uint64_t nbv3;
+} ggml_metal_kargs_qsa_score;
+
+typedef struct {
+    int32_t  n_blocks;
+    int32_t  n_queries;
+    uint64_t nbc3;
+    uint64_t nbv1;
+    uint64_t nbv3;
+    uint64_t nbt1;
+    uint64_t nbt3;
+} ggml_metal_kargs_qsa_expand;
 
 typedef struct {
     int32_t  n_tokens;

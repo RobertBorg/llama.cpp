@@ -1,5 +1,7 @@
 #include "arg.h"
 #include "common.h"
+#include "ggml-backend.h"
+#include "ggml.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -8,6 +10,32 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+struct qwen4exp_rollback_capture {
+    bool k4_seen = false;
+    ggml_backend_dev_t dev = nullptr;
+};
+
+static bool qwen4exp_rollback_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const ggml_tensor * gdn = tensor->src[0];
+    int32_t snapshot_count = 0;
+    if (gdn != nullptr) {
+        memcpy(&snapshot_count, gdn->op_params, sizeof(snapshot_count));
+    }
+    const bool k4 = strcmp(tensor->name, "attn_output-0") == 0 &&
+        gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET && snapshot_count == 4 &&
+        tensor->ne[0] == 128 && tensor->ne[1] == 2 && tensor->ne[2] == 4 && tensor->ne[3] == 1;
+    if (ask) {
+        return k4;
+    }
+
+    auto * capture = static_cast<qwen4exp_rollback_capture *>(user_data);
+    if (k4 && tensor->buffer != nullptr) {
+        capture->k4_seen = true;
+        capture->dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    }
+    return true;
+}
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
     auto cparams = common_context_params_to_llama(params);
@@ -322,12 +350,32 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
+    qwen4exp_rollback_capture capture;
+    ggml_backend_dev_t requested_dev = nullptr;
+    size_t n_requested_devices = 0;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev == nullptr) {
+            break;
+        }
+        requested_dev = dev;
+        ++n_requested_devices;
+    }
+    const bool capture_device = params.n_gpu_layers <= -2 && n_requested_devices == 1;
+    if (capture_device) {
+        params.cb_eval = qwen4exp_rollback_capture_cb;
+        params.cb_eval_user_data = &capture;
+    }
+
     common_init_result_ptr llama_init = common_init_from_params(params);
     llama_model * model = llama_init->model();
     if (model == nullptr) {
         fprintf(stderr, "%s : failed to init model\n", __func__);
         return 1;
     }
+    char architecture[32];
+    const bool require_device = capture_device &&
+        llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) >= 0 &&
+        strcmp(architecture, "qwen4exp") == 0;
 
     if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
         fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
@@ -498,6 +546,11 @@ int main(int argc, char ** argv) {
     }
 
     if (!test_speculative_prefill_rollback(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (require_device && (!capture.k4_seen || capture.dev != requested_dev)) {
+        fprintf(stderr, "%s : K=4 speculative rollback did not run on %s\n", __func__, ggml_backend_dev_name(requested_dev));
         return 1;
     }
 

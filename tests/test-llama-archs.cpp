@@ -74,7 +74,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [--test name --device device] [-v/--verbose] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -544,13 +544,43 @@ static std::vector<float> get_qwen4exp_unified_logits(
     return result;
 }
 
-static void test_qwen4exp_qsa_unified_sequences() {
+struct qwen4exp_qsa_unified_capture {
+    bool dense_mask_seen = false;
+    int64_t score_tokens = 0;
+    int64_t score_lanes = 0;
+    ggml_backend_dev_t score_dev = nullptr;
+};
+
+static bool qwen4exp_qsa_unified_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const bool qsa_mask      = strncmp(tensor->name, "qsa_mask-",      strlen("qsa_mask-")) == 0;
+    const bool indexer_score = strncmp(tensor->name, "indexer_score-", strlen("indexer_score-")) == 0;
+    if (ask) {
+        return qsa_mask || indexer_score;
+    }
+
+    auto * capture = static_cast<qwen4exp_qsa_unified_capture *>(user_data);
+    capture->dense_mask_seen |= qsa_mask;
+    if (indexer_score && tensor->buffer != nullptr) {
+        capture->score_tokens = tensor->ne[1];
+        capture->score_lanes = tensor->ne[2];
+        capture->score_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    }
+    return true;
+}
+
+static void test_qwen4exp_qsa_unified_sequences(const std::vector<ggml_backend_dev_t> & devs) {
     constexpr size_t   seed     = 3321213324;
     constexpr uint32_t n_prompt = 32;
     constexpr uint32_t n_vocab  = 128;
+    constexpr uint32_t n_lane   = 2;
 
+    qwen4exp_qsa_unified_capture capture;
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
-    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2, true);
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, LLAMA_SPLIT_MODE_LAYER, false, n_lane, true,
+            qwen4exp_qsa_unified_capture_cb, &capture);
+    if (!devs.empty()) {
+        GGML_ASSERT(model_and_ctx.first->dev_layer(1) == devs.front());
+    }
 
     const std::vector<llama_token> target      = get_tokens(n_prompt, n_vocab, seed);
     const std::vector<llama_token> companion_a = get_tokens(n_prompt, n_vocab, seed + 1);
@@ -563,6 +593,13 @@ static void test_qwen4exp_qsa_unified_sequences() {
     const auto seq1_a = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_a, 1);
     const auto seq1_b = get_qwen4exp_unified_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), target, companion_b, 1);
     GGML_ASSERT(seq1_a == seq1_b);
+
+    if (!devs.empty()) {
+        GGML_ASSERT(capture.dense_mask_seen);
+        GGML_ASSERT(capture.score_tokens == n_prompt);
+        GGML_ASSERT(capture.score_lanes == n_lane);
+        GGML_ASSERT(capture.score_dev == devs.front());
+    }
 }
 
 static void test_qwen4exp_qsa_non_causal() {
@@ -827,20 +864,20 @@ static void test_qwen4exp_qsa_sparse_crossover() {
     auto model_and_ctx = get_model_and_ctx(
             gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
             qwen4exp_qsa_capture_cb, &capture);
-    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(64, 128, seed));
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(256, 128, seed));
     GGML_ASSERT(capture.dense_mask_seen);
     GGML_ASSERT(!capture.compact_ids_seen);
 
     capture = {};
-    capture.query = 63;
-    llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
-    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(320, 128, seed + 1));
+    capture.query = 3;
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(4, 128, seed + 1), false, 0, 256);
+    GGML_ASSERT(!capture.dense_mask_seen);
     GGML_ASSERT(capture.compact_ids_seen);
 
     capture = {};
     capture.query = 63;
     GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(model_and_ctx.second.get()), 0, -1, -1));
-    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(64, 128, seed + 2));
+    get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), get_tokens(256, 128, seed + 2));
     GGML_ASSERT(capture.raw_key_seen);
     GGML_ASSERT(capture.dense_mask_seen);
     GGML_ASSERT(!capture.compact_ids_seen);
@@ -984,16 +1021,21 @@ static void test_qwen4exp_qsa_pool_precision() {
 
 struct qwen4exp_ple_capture {
     std::vector<int32_t> rows;
+    ggml_backend_dev_t conv_dev = nullptr;
 };
 
 static bool qwen4exp_ple_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
-    const bool ple_embd = strncmp(tensor->name, "ple_embd-", strlen("ple_embd-")) == 0;
+    const bool ple_embd     = strncmp(tensor->name, "ple_embd-",     strlen("ple_embd-")) == 0;
+    const bool ple_conv_out = strncmp(tensor->name, "ple_conv_out-", strlen("ple_conv_out-")) == 0;
     if (ask) {
-        return ple_embd;
+        return ple_embd || ple_conv_out;
     }
 
+    auto * capture = static_cast<qwen4exp_ple_capture *>(user_data);
+    if (ple_conv_out && tensor->buffer != nullptr) {
+        capture->conv_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    }
     if (ple_embd) {
-        auto * capture = static_cast<qwen4exp_ple_capture *>(user_data);
         const ggml_tensor * gather = tensor;
         while (gather != nullptr && gather->op != GGML_OP_GET_ROWS) {
             gather = gather->src[0];
@@ -1035,15 +1077,21 @@ static void decode_qwen4exp_image_chunk(llama_context * lctx, int32_t x0, int32_
     GGML_ASSERT(llama_decode(lctx, batch) == 0);
 }
 
-static void test_qwen4exp_ple_split_mrope_history() {
+static void test_qwen4exp_ple_split_mrope_history(const std::vector<ggml_backend_dev_t> & devs) {
     constexpr size_t seed = 3321213324;
 
     qwen4exp_ple_capture capture;
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
-    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
+    auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, devs, LLAMA_SPLIT_MODE_LAYER, false, 1, false,
             qwen4exp_ple_capture_cb, &capture);
+    if (!devs.empty()) {
+        GGML_ASSERT(model_and_ctx.first->dev_layer(0) == devs.front());
+    }
 
     decode_qwen4exp_image_chunk(model_and_ctx.second.get(), 0, 65);
+    if (!devs.empty()) {
+        GGML_ASSERT(capture.conv_dev == devs.front());
+    }
 
     const int32_t hash = (qwen4exp_ple_image_token_id ^ 2*qwen4exp_ple_image_token_id) % 8;
     const std::vector<int32_t> expected = { hash, hash + 8, hash + 16, hash + 24 };
@@ -1698,6 +1746,21 @@ static void test_qwen4exp_moe_stream_exact() {
     };
     assert_stream_memory(streamed.first.get(), false);
 
+    size_t streamed_static_memory = 0;
+    for (const auto & [_, size] : streamed.first->memory_breakdown()) {
+        streamed_static_memory += size;
+    }
+    for (const auto & [_, size] : streamed.first->moe_stream()->memory_breakdown(false)) {
+        GGML_ASSERT(streamed_static_memory >= size);
+        streamed_static_memory -= size;
+    }
+    const auto baseline_memory = baseline.first->memory_breakdown();
+    size_t baseline_static_memory = 0;
+    for (const auto & [_, size] : baseline_memory) {
+        baseline_static_memory += size;
+    }
+    GGML_ASSERT(streamed_static_memory < baseline_static_memory);
+
     llama_model_params two_thread_params = make_model_params(true);
     two_thread_params.moe_stream_io_threads = 2;
     llama_model_ptr two_thread(llama_model_load_from_file(path.c_str(), two_thread_params));
@@ -1907,13 +1970,36 @@ static void test_qwen4exp_moe_stream_exact() {
     GGML_ASSERT(stream->stats.n_miss > stream->stats.n_miss_cold);
 }
 
-static void test_qwen4exp_mtp_decode() {
+struct qwen4exp_mtp_capture {
+    ggml_backend_dev_t projection_dev = nullptr;
+};
+
+static bool qwen4exp_mtp_capture_cb(ggml_tensor * tensor, bool ask, void * user_data) {
+    const bool projection = strncmp(tensor->name, "mtp_eh_proj-", strlen("mtp_eh_proj-")) == 0;
+    if (ask) {
+        return projection;
+    }
+
+    auto * capture = static_cast<qwen4exp_mtp_capture *>(user_data);
+    if (projection && tensor->buffer != nullptr) {
+        capture->projection_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+    }
+    return true;
+}
+
+static void test_qwen4exp_mtp_decode(const std::vector<ggml_backend_dev_t> & devs) {
     const size_t seed = 0x4d5450;
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, false, true);
 
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     model_params.load_mtp = true;
+    std::vector<ggml_backend_dev_t> devs_copy;
+    if (!devs.empty()) {
+        devs_copy = devs;
+        devs_copy.push_back(nullptr);
+        model_params.devices = devs_copy.data();
+    }
 
     size_t tensor_seed = seed;
     llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
@@ -1927,6 +2013,11 @@ static void test_qwen4exp_mtp_decode() {
     target_params.n_ubatch = 4;
     target_params.n_threads = 4;
     target_params.n_threads_batch = 4;
+    qwen4exp_mtp_capture capture;
+    if (!devs.empty()) {
+        target_params.cb_eval = qwen4exp_mtp_capture_cb;
+        target_params.cb_eval_user_data = &capture;
+    }
 
     llama_context_ptr target(llama_init_from_model(model.get(), target_params));
     GGML_ASSERT(target != nullptr);
@@ -1983,6 +2074,11 @@ static void test_qwen4exp_mtp_decode() {
     };
 
     const auto expected = decode_mtp(model.get());
+    if (!devs.empty()) {
+        GGML_ASSERT(model->dev_layer(2) == devs.front());
+        GGML_ASSERT(capture.projection_dev == devs.front());
+        capture = {};
+    }
 
     const std::string path = (std::filesystem::temp_directory_path()/
             ("llama-qwen4exp-mtp-" + std::to_string(ggml_time_us()) + ".gguf")).string();
@@ -2032,6 +2128,10 @@ static void test_qwen4exp_mtp_decode() {
     GGML_ASSERT(detached->layers[0].hc_attn_norm == nullptr);
 
     const auto actual = decode_mtp(detached.get());
+    if (!devs.empty()) {
+        GGML_ASSERT(detached->dev_layer(2) == devs.front());
+        GGML_ASSERT(capture.projection_dev == devs.front());
+    }
     GGML_ASSERT(expected == actual);
 }
 
@@ -2088,14 +2188,50 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
     return 0;
 }
 
+static int run_selected_test(const std::string & test, const std::string & device) {
+    if (test != "qwen4exp-ple-split-mrope-history" &&
+            test != "qwen4exp-qsa-unified-sequences" &&
+            test != "qwen4exp-mtp-decode") {
+        fprintf(stderr, "unknown test: %s\n", test.c_str());
+        return 1;
+    }
+    if (device.empty()) {
+        fprintf(stderr, "%s requires --device\n", test.c_str());
+        return 1;
+    }
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t dev = ggml_backend_dev_by_name(device.c_str());
+    if (dev == nullptr) {
+        fprintf(stderr, "unknown device: %s\n", device.c_str());
+        return 1;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "MTL") != 0) {
+        fprintf(stderr, "%s requires a Metal device\n", test.c_str());
+        return 1;
+    }
+
+    printf("%s: using device %s (%s)\n", test.c_str(), ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+    if (test == "qwen4exp-ple-split-mrope-history") {
+        test_qwen4exp_ple_split_mrope_history({ dev });
+    } else if (test == "qwen4exp-qsa-unified-sequences") {
+        test_qwen4exp_qsa_unified_sequences({ dev });
+    } else {
+        test_qwen4exp_mtp_decode({ dev });
+    }
+    return 0;
+}
+
 static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
     if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
         test_qwen4exp_ple_metadata_save();
-        test_qwen4exp_ple_split_mrope_history();
+        test_qwen4exp_ple_split_mrope_history({});
         test_qwen4exp_ple_shared_prefix();
         test_qwen4exp_indexer_seq_cp();
         test_qwen4exp_unified_prefix_state();
-        test_qwen4exp_qsa_unified_sequences();
+        test_qwen4exp_qsa_unified_sequences({});
         test_qwen4exp_qsa_non_causal();
         test_qwen4exp_qsa_ratio_one();
         test_qwen4exp_qsa_no_flash_attn();
@@ -2105,7 +2241,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         test_qwen4exp_qsa_norm_layout();
         test_qwen4exp_qsa_block_semantics();
         test_qwen4exp_qsa_pool_precision();
-        test_qwen4exp_mtp_decode();
+        test_qwen4exp_mtp_decode({});
         test_qwen4exp_moe_stream_exact();
     }
 
@@ -2282,6 +2418,8 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    std::string test;
+    std::string device;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -2313,6 +2451,22 @@ int main(int argc, char ** argv) {
             log_level = GGML_LOG_LEVEL_INFO;
             continue;
         }
+        if (strcmp(argv[i], "--test") == 0) {
+            if (i + 1 < argc) {
+                test = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "--device") == 0) {
+            if (i + 1 < argc) {
+                device = argv[++i];
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
@@ -2325,6 +2479,13 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (!test.empty()) {
+            return run_selected_test(test, device);
+        }
+        if (!device.empty()) {
+            fprintf(stderr, "--device requires --test\n");
+            return 1;
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }

@@ -2250,3 +2250,229 @@ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+
+kernel void kernel_qsa_score_f32(
+        constant ggml_metal_kargs_qsa_score & args,
+        device const char  * q,
+        device const char  * k,
+        device const char  * visible,
+        device       float * scores,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short D          = 128;
+    constexpr short N_HEAD     = 4;
+    constexpr short N_BLOCK_SG = 8;
+    constexpr short N_BLOCK_TG = 64;
+
+    const int i_query = tgpig.y;
+    const int i_lane  = tgpig.z;
+
+    device const float * q_row = (device const float *) (q + i_query*args.nbq2 + i_lane*args.nbq3);
+    device const int32_t * visible_row = (device const int32_t *) (visible + i_query*args.nbv1 + i_lane*args.nbv3);
+    device float * scores_row = scores + (i_lane*args.n_queries + i_query)*args.n_blocks;
+
+    const int n_visible = visible_row[0];
+    const int i_block_0 = tgpig.x*N_BLOCK_TG + sgitg*N_BLOCK_SG;
+
+    FOR_UNROLL (short ib = 0; ib < N_BLOCK_SG; ++ib) {
+        const int i_block = i_block_0 + ib;
+
+        if (i_block >= args.n_blocks) {
+            continue;
+        }
+
+        if (i_block >= n_visible) {
+            if (tiisg == 0) {
+                scores_row[i_block] = -INFINITY;
+            }
+            continue;
+        }
+
+        device const float * k_row = (device const float *) (k + i_block*args.nbk1 + i_lane*args.nbk3);
+
+        float score = 0.0f;
+
+        FOR_UNROLL (short ih = 0; ih < N_HEAD; ++ih) {
+            device const float * q_head = (device const float *) ((device const char *) q_row + ih*args.nbq1);
+
+            float qk = 0.0f;
+            FOR_UNROLL (short id = tiisg; id < D; id += N_SIMDWIDTH) {
+                qk += q_head[id]*k_row[id];
+            }
+
+            score += max(simd_sum(qk), 0.0f);
+        }
+
+        if (tiisg == 0) {
+            scores_row[i_block] = score;
+        }
+    }
+}
+
+kernel void kernel_qsa_expand_i32(
+        constant ggml_metal_kargs_qsa_expand & args,
+        device const int32_t * top_blocks,
+        device const char    * block_cells,
+        device const char    * visible,
+        device const char    * tail,
+        device       int32_t * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    constexpr short R           = 4;
+    constexpr int   N_TOP_BLOCK = 512;
+    constexpr int   N_TOP_CELL  = R*N_TOP_BLOCK;
+    constexpr short N_TAIL      = R - 1;
+    constexpr int   N_DST       = N_TOP_CELL + N_TAIL;
+
+    const int i_query = tgpig.y;
+    const int i_lane  = tgpig.z;
+    const int i_dst   = tgpig.x*ntg.x + tiitg;
+
+    if (i_dst >= N_DST) {
+        return;
+    }
+
+    device const int32_t * top_row = top_blocks + (i_lane*args.n_queries + i_query)*N_TOP_BLOCK;
+    device const int32_t * visible_row = (device const int32_t *) (visible + i_query*args.nbv1 + i_lane*args.nbv3);
+    device int32_t * dst_row = dst + (i_lane*args.n_queries + i_query)*N_DST;
+
+    if (i_dst < N_TOP_CELL) {
+        const int i_block = top_row[i_dst/R];
+
+        if (i_block >= 0 && i_block < visible_row[0] && i_block < args.n_blocks) {
+            device const int32_t * block_cells_row = (device const int32_t *) (block_cells + i_lane*args.nbc3);
+            dst_row[i_dst] = block_cells_row[R*i_block + i_dst%R];
+        } else {
+            dst_row[i_dst] = -1;
+        }
+    } else {
+        device const int32_t * tail_row = (device const int32_t *) (tail + i_query*args.nbt1 + i_lane*args.nbt3);
+        dst_row[i_dst] = tail_row[i_dst - N_TOP_CELL];
+    }
+}
+
+kernel void kernel_flash_attn_ext_indexed_q8_0(
+        constant ggml_metal_kargs_flash_attn_ext_indexed & args,
+        device const char    * q,
+        device const char    * k,
+        device const char    * v,
+        device const char    * ids,
+        device       float   * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr short D        = OP_FLASH_ATTN_EXT_INDEXED_D;
+    constexpr short GQA      = OP_FLASH_ATTN_EXT_INDEXED_GQA;
+    constexpr short ID_TILE  = 16;
+    constexpr short N_BLOCK  = D/QK8_0;
+    constexpr short ROW_U4   = sizeof(block_q8_0)*N_BLOCK/sizeof(uint4);
+    constexpr short TILE_U4  = ID_TILE*2*ROW_U4;
+
+    static_assert(sizeof(block_q8_0)*N_BLOCK % sizeof(uint4) == 0, "Q8 row must be uint4 aligned");
+
+    const int i_query  = tgpig.x;
+    const int i_kvhead = tgpig.y;
+    const int i_seq    = tgpig.z;
+    const int i_head   = i_kvhead*GQA + sgitg;
+
+    const int i_kseq = i_seq/(args.ne03/args.ne13);
+    const int i_vseq = i_seq/(args.ne03/args.ne23);
+
+    device const float * q_row = (device const float *) (q + i_query*args.nb01 + i_head*args.nb02 + i_seq*args.nb03);
+    device const int32_t * ids_row = (device const int32_t *) (ids + i_query*args.nb31 + i_seq*args.nb33);
+
+    float q_reg[N_BLOCK];
+    float acc[N_BLOCK];
+
+    FOR_UNROLL (short ib = 0; ib < N_BLOCK; ++ib) {
+        q_reg[ib] = q_row[ib*N_SIMDWIDTH + tiisg];
+        acc[ib]   = 0.0f;
+    }
+
+    threadgroup int32_t ids_tile[ID_TILE];
+    threadgroup uint4 k_tile[ID_TILE][ROW_U4];
+    threadgroup uint4 v_tile[ID_TILE][ROW_U4];
+
+    float maximum = -FLT_MAX;
+    float sum      = 0.0f;
+
+    for (int i0 = 0; i0 < args.ne30; i0 += ID_TILE) {
+        const int tile_size = min((int) ID_TILE, args.ne30 - i0);
+
+        if (tiitg < ID_TILE) {
+            ids_tile[tiitg] = tiitg < tile_size ? ids_row[i0 + tiitg] : -1;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short i = tiitg; i < TILE_U4; i += OP_FLASH_ATTN_EXT_INDEXED_NTHREADS) {
+            const short iid  = i/(2*ROW_U4);
+            const short rem  = i - iid*(2*ROW_U4);
+            const bool  is_v = rem >= ROW_U4;
+            const short iu4  = rem - (is_v ? ROW_U4 : 0);
+            const int token  = ids_tile[iid];
+
+            if (token >= 0 && token < args.ne11) {
+                device const char * row = is_v
+                    ? v + token*args.nb21 + i_kvhead*args.nb22 + i_vseq*args.nb23
+                    : k + token*args.nb11 + i_kvhead*args.nb12 + i_kseq*args.nb13;
+                const uint4 value = ((device const uint4 *) row)[iu4];
+
+                if (is_v) {
+                    v_tile[iid][iu4] = value;
+                } else {
+                    k_tile[iid][iu4] = value;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short iid = 0; iid < ID_TILE; ++iid) {
+            const int token = ids_tile[iid];
+            if (iid >= tile_size || token < 0 || token >= args.ne11) {
+                continue;
+            }
+
+            threadgroup const block_q8_0 * k_row = (threadgroup const block_q8_0 *) k_tile[iid];
+
+            float qk = 0.0f;
+            FOR_UNROLL (short ib = 0; ib < N_BLOCK; ++ib) {
+                qk += q_reg[ib]*(float) k_row[ib].d*(float) k_row[ib].qs[tiisg];
+            }
+
+            const float score = simd_sum(qk)*args.scale;
+
+            float weight = 1.0f;
+            if (score > maximum) {
+                const float rescale = maximum == -FLT_MAX ? 0.0f : exp(maximum - score);
+                FOR_UNROLL (short ib = 0; ib < N_BLOCK; ++ib) {
+                    acc[ib] *= rescale;
+                }
+                sum = sum*rescale + 1.0f;
+                maximum = score;
+            } else {
+                weight = exp(score - maximum);
+                sum += weight;
+            }
+
+            threadgroup const block_q8_0 * v_row = (threadgroup const block_q8_0 *) v_tile[iid];
+            FOR_UNROLL (short ib = 0; ib < N_BLOCK; ++ib) {
+                acc[ib] += weight*(float) v_row[ib].d*(float) v_row[ib].qs[tiisg];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_sum = sum == 0.0f ? 0.0f : 1.0f/sum;
+    const uint64_t i_dst_row = ((uint64_t) i_seq*args.ne01 + i_query)*args.ne02 + i_head;
+    device float * dst_row = dst + i_dst_row*D;
+
+    FOR_UNROLL (short ib = 0; ib < N_BLOCK; ++ib) {
+        dst_row[ib*N_SIMDWIDTH + tiisg] = acc[ib]*inv_sum;
+    }
+}
