@@ -325,6 +325,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
+        case GGML_OP_QSA_INDEXER:
+            {
+                n_fuse = ggml_metal_op_qsa_indexer(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -461,6 +465,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 n_fuse = ggml_metal_op_flash_attn_ext(ctx, idx);
+            } break;
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            {
+                n_fuse = ggml_metal_op_flash_attn_ext_indexed(ctx, idx);
             } break;
         case GGML_OP_SET:
             {
@@ -1374,6 +1382,261 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
             (k->ne[2] + nkptg - 1)/nkptg,
             (q->ne[2] + nbptg - 1)/nbptg,
             q->ne[3], 32, nsg, 1);
+
+    return 1;
+}
+
+static size_t ggml_metal_op_qsa_indexer_queries_per_tile(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_QSA_INDEXER);
+
+    const size_t n_blocks  = op->src[1]->ne[1];
+    const size_t n_queries = op->src[0]->ne[2];
+    const size_t max_size  = std::numeric_limits<size_t>::max();
+
+    GGML_ASSERT(n_blocks > 0 && n_queries > 0);
+    GGML_ASSERT(n_blocks <= max_size/sizeof(float));
+
+    const size_t row_size = sizeof(float)*n_blocks;
+    const size_t max_plane_size = (OP_QSA_INDEXER_MAX_SCRATCH/3)/32*32;
+    if (row_size > max_plane_size) {
+        return 0;
+    }
+
+    return std::min(n_queries, max_plane_size/row_size);
+}
+
+static size_t ggml_metal_op_qsa_indexer_scratch_size(const ggml_tensor * op) {
+    const size_t n_queries = ggml_metal_op_qsa_indexer_queries_per_tile(op);
+    if (n_queries == 0) {
+        return 0;
+    }
+
+    return GGML_PAD(sizeof(float)*op->src[1]->ne[1]*n_queries, 32);
+}
+
+size_t ggml_metal_op_qsa_indexer_extra(const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_QSA_INDEXER);
+
+    const size_t output_size  = ggml_nbytes(op);
+    const size_t scratch_size = ggml_metal_op_qsa_indexer_scratch_size(op);
+    const size_t max_size     = std::numeric_limits<size_t>::max();
+
+    GGML_ASSERT(output_size <= max_size - 31);
+
+    const size_t total = GGML_PAD(output_size, 32);
+    GGML_ASSERT(scratch_size <= (max_size - total)/3);
+
+    return total + 3*scratch_size - output_size;
+}
+
+int ggml_metal_op_qsa_indexer(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q           = op->src[0];
+    const ggml_tensor * k           = op->src[1];
+    const ggml_tensor * block_cells = op->src[2];
+    const ggml_tensor * visible     = op->src[3];
+    const ggml_tensor * tail        = op->src[4];
+
+    GGML_ASSERT(op->op == GGML_OP_QSA_INDEXER);
+    GGML_ASSERT(ggml_get_op_params_i32(op, 0) == OP_QSA_INDEXER_BLOCK_SIZE);
+    GGML_ASSERT(ggml_get_op_params_i32(op, 1) == OP_QSA_INDEXER_TOKEN_TOP_K);
+
+    const int32_t n_blocks  = k->ne[1];
+    const int32_t n_queries = q->ne[2];
+    const int32_t n_lanes   = q->ne[3];
+
+    const int32_t queries_per_tile = ggml_metal_op_qsa_indexer_queries_per_tile(op);
+    const size_t scratch_size = ggml_metal_op_qsa_indexer_scratch_size(op);
+    GGML_ASSERT(queries_per_tile > 0 && scratch_size > 0);
+
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    ggml_metal_buffer_id bid_scores = bid_dst;
+    bid_scores.offs += GGML_PAD(ggml_nbytes(op), 32);
+
+    ggml_metal_buffer_id bid_indices_0 = bid_scores;
+    bid_indices_0.offs += scratch_size;
+
+    ggml_metal_buffer_id bid_indices_1 = bid_indices_0;
+    bid_indices_1.offs += scratch_size;
+
+    auto pipeline_top_k = ggml_metal_library_get_pipeline_qsa_top_k(lib);
+
+    int nth = 1;
+    while (nth < n_blocks && 2*nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_top_k)) {
+        nth *= 2;
+    }
+
+    const int npr = (n_blocks + nth - 1)/nth;
+    const size_t smem = GGML_PAD(nth*sizeof(int32_t), 16);
+
+    auto pipeline_merge = ggml_metal_library_get_pipeline_qsa_top_k_merge(lib);
+
+    bool first_tile = true;
+    for (int32_t lane = 0; lane < n_lanes; ++lane) {
+        for (int32_t query = 0; query < n_queries; query += queries_per_tile) {
+            const int32_t tile_queries = std::min(queries_per_tile, n_queries - query);
+
+            if (!first_tile) {
+                ggml_metal_op_concurrency_reset(ctx);
+            }
+            first_tile = false;
+
+            ggml_metal_buffer_id bid_q = ggml_metal_get_buffer_id(q);
+            bid_q.offs += lane*q->nb[3] + query*q->nb[2];
+
+            ggml_metal_buffer_id bid_k = ggml_metal_get_buffer_id(k);
+            bid_k.offs += lane*k->nb[3];
+
+            ggml_metal_buffer_id bid_block_cells = ggml_metal_get_buffer_id(block_cells);
+            bid_block_cells.offs += lane*block_cells->nb[3];
+
+            ggml_metal_buffer_id bid_visible = ggml_metal_get_buffer_id(visible);
+            bid_visible.offs += lane*visible->nb[3] + query*visible->nb[1];
+
+            ggml_metal_buffer_id bid_tail = ggml_metal_get_buffer_id(tail);
+            bid_tail.offs += lane*tail->nb[3] + query*tail->nb[1];
+
+            ggml_metal_buffer_id bid_tile_dst = bid_dst;
+            bid_tile_dst.offs += lane*op->nb[3] + query*op->nb[1];
+
+            {
+                ggml_metal_kargs_qsa_score args = {
+                    /*.n_blocks  =*/ n_blocks,
+                    /*.n_queries =*/ tile_queries,
+                    /*.nbq1      =*/ q->nb[1],
+                    /*.nbq2      =*/ q->nb[2],
+                    /*.nbq3      =*/ q->nb[3],
+                    /*.nbk1      =*/ k->nb[1],
+                    /*.nbk3      =*/ k->nb[3],
+                    /*.nbv1      =*/ visible->nb[1],
+                    /*.nbv3      =*/ visible->nb[3],
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline_qsa_score(lib);
+
+                GGML_ASSERT(OP_QSA_INDEXER_NTHREADS <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_q,       1);
+                ggml_metal_encoder_set_buffer  (enc, bid_k,       2);
+                ggml_metal_encoder_set_buffer  (enc, bid_visible, 3);
+                ggml_metal_encoder_set_buffer  (enc, bid_scores,  4);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc,
+                        (n_blocks + OP_QSA_INDEXER_NBPTG - 1)/OP_QSA_INDEXER_NBPTG,
+                        tile_queries, 1, OP_QSA_INDEXER_NTHREADS, 1, 1);
+            }
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const uint64_t nb00 = sizeof(float);
+            const uint64_t nb01 = nb00*n_blocks;
+            const uint64_t nb02 = nb01*tile_queries;
+            const uint64_t nb03 = nb02;
+
+            ggml_metal_kargs_argsort args_top_k = {
+                /*.ne00  =*/ n_blocks,
+                /*.ne01  =*/ tile_queries,
+                /*.ne02  =*/ 1,
+                /*.ne03  =*/ 1,
+                /*.nb00  =*/ nb00,
+                /*.nb01  =*/ nb01,
+                /*.nb02  =*/ nb02,
+                /*.nb03  =*/ nb03,
+                /*.ne0   =*/ OP_QSA_INDEXER_BLOCK_TOP_K,
+                /*.ne1   =*/ tile_queries,
+                /*.ne2   =*/ 1,
+                /*.ne3   =*/ 1,
+                /*.top_k =*/ std::min(nth, OP_QSA_INDEXER_BLOCK_TOP_K),
+            };
+
+            if (npr > 1) {
+                args_top_k.ne0 = (npr - 1)*args_top_k.top_k +
+                        std::min(n_blocks - (npr - 1)*nth, args_top_k.top_k);
+            }
+
+            ggml_metal_buffer_id bid_indices = bid_indices_0;
+            ggml_metal_buffer_id bid_next    = bid_indices_1;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_top_k);
+            ggml_metal_encoder_set_bytes   (enc, &args_top_k, sizeof(args_top_k), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_scores,  1);
+            ggml_metal_encoder_set_buffer  (enc, bid_indices, 2);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, npr*tile_queries, 1, 1, nth, 1, 1);
+
+            int len = args_top_k.top_k;
+            while (len < args_top_k.ne0) {
+                ggml_metal_op_concurrency_reset(ctx);
+
+                const int nm = (args_top_k.ne0 + 2*len - 1)/(2*len);
+                const int nth_merge = std::min(512,
+                        std::min(len, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge)));
+
+                ggml_metal_kargs_argsort_merge args_merge = {
+                    /*.ne00  =*/ n_blocks,
+                    /*.ne01  =*/ tile_queries,
+                    /*.ne02  =*/ 1,
+                    /*.ne03  =*/ 1,
+                    /*.nb00  =*/ nb00,
+                    /*.nb01  =*/ nb01,
+                    /*.nb02  =*/ nb02,
+                    /*.nb03  =*/ nb03,
+                    /*.ne0   =*/ args_top_k.ne0,
+                    /*.ne1   =*/ tile_queries,
+                    /*.ne2   =*/ 1,
+                    /*.ne3   =*/ 1,
+                    /*.top_k =*/ nm == 1 ? OP_QSA_INDEXER_BLOCK_TOP_K : args_top_k.ne0,
+                    /*.len   =*/ len,
+                };
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline_merge);
+                ggml_metal_encoder_set_bytes   (enc, &args_merge, sizeof(args_merge), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_scores,  1);
+                ggml_metal_encoder_set_buffer  (enc, bid_indices, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_next,    3);
+                ggml_metal_encoder_dispatch_threadgroups(enc, nm*tile_queries, 1, 1, nth_merge, 1, 1);
+
+                std::swap(bid_indices, bid_next);
+                len <<= 1;
+            }
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            {
+                ggml_metal_kargs_qsa_expand args = {
+                    /*.n_blocks  =*/ n_blocks,
+                    /*.n_queries =*/ tile_queries,
+                    /*.nbc3      =*/ block_cells->nb[3],
+                    /*.nbv1      =*/ visible->nb[1],
+                    /*.nbv3      =*/ visible->nb[3],
+                    /*.nbt1      =*/ tail->nb[1],
+                    /*.nbt3      =*/ tail->nb[3],
+                };
+
+                auto pipeline = ggml_metal_library_get_pipeline_qsa_expand(lib);
+
+                GGML_ASSERT(OP_QSA_INDEXER_NTHREADS <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_indices,     1);
+                ggml_metal_encoder_set_buffer  (enc, bid_block_cells, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_visible,     3);
+                ggml_metal_encoder_set_buffer  (enc, bid_tail,        4);
+                ggml_metal_encoder_set_buffer  (enc, bid_tile_dst,    5);
+                ggml_metal_encoder_dispatch_threadgroups(enc,
+                        (OP_QSA_INDEXER_N_IDS + OP_QSA_INDEXER_NTHREADS - 1)/OP_QSA_INDEXER_NTHREADS,
+                        tile_queries, 1, OP_QSA_INDEXER_NTHREADS, 1, 1);
+            }
+        }
+    }
 
     return 1;
 }
@@ -2621,6 +2884,25 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     const uint32_t r2 = 1;
     const uint32_t r3 = 1;
+    const bool masked = ggml_mul_mat_id_get_masked(op);
+
+    if (masked) {
+        ggml_metal_kargs_memset args = {
+            /*.val =*/ 0,
+            /*.ne  =*/ (uint64_t) ggml_nelements(op),
+        };
+
+        auto pipeline = ggml_metal_library_get_pipeline_memset(lib, op);
+        const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), 256);
+        const int64_t n = (ggml_nelements(op) + nth - 1)/nth;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer(enc, bid_dst, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
@@ -2745,6 +3027,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ nb1,
             /*.nr0  =*/ nr0,
+            /*.masked =*/ masked,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
@@ -2818,6 +3101,66 @@ int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
     const int nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_flash_attn_ext_indexed(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q   = op->src[0];
+    const ggml_tensor * k   = op->src[1];
+    const ggml_tensor * v   = op->src[2];
+    const ggml_tensor * ids = op->src[3];
+
+    GGML_ASSERT(op->op == GGML_OP_FLASH_ATTN_EXT_INDEXED);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32);
+
+    float scale;
+    memcpy(&scale, op->op_params, sizeof(scale));
+
+    ggml_metal_kargs_flash_attn_ext_indexed args = {
+        /*.ne01  =*/ (int32_t) q->ne[1],
+        /*.ne02  =*/ (int32_t) q->ne[2],
+        /*.ne03  =*/ (int32_t) q->ne[3],
+        /*.nb01  =*/ q->nb[1],
+        /*.nb02  =*/ q->nb[2],
+        /*.nb03  =*/ q->nb[3],
+        /*.ne11  =*/ (int32_t) k->ne[1],
+        /*.ne12  =*/ (int32_t) k->ne[2],
+        /*.ne13  =*/ (int32_t) k->ne[3],
+        /*.nb11  =*/ k->nb[1],
+        /*.nb12  =*/ k->nb[2],
+        /*.nb13  =*/ k->nb[3],
+        /*.ne22  =*/ (int32_t) v->ne[2],
+        /*.ne23  =*/ (int32_t) v->ne[3],
+        /*.nb21  =*/ v->nb[1],
+        /*.nb22  =*/ v->nb[2],
+        /*.nb23  =*/ v->nb[3],
+        /*.ne30  =*/ (int32_t) ids->ne[0],
+        /*.nb31  =*/ ids->nb[1],
+        /*.nb33  =*/ ids->nb[3],
+        /*.scale =*/ scale,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_indexed(lib);
+
+    GGML_ASSERT(OP_FLASH_ATTN_EXT_INDEXED_NTHREADS <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),   2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),   3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),  5);
+    ggml_metal_encoder_dispatch_threadgroups(enc,
+            args.ne01, args.ne12, args.ne03, 32, OP_FLASH_ATTN_EXT_INDEXED_GQA, 1);
 
     return 1;
 }
@@ -5348,7 +5691,10 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
 
     {
-        ggml_metal_kargs_memset args = { /*.val =*/ 0 };
+        ggml_metal_kargs_memset args = {
+            /*.val =*/ 0,
+            /*.ne  =*/ 1,
+        };
 
         auto pipeline = ggml_metal_library_get_pipeline_memset(lib, op);
 

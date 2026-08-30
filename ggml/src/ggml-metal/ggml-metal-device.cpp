@@ -495,6 +495,50 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_score(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_score_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_top_k(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_top_k_f32_i32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_top_k_merge(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_top_k_merge_f32_i32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_expand(ggml_metal_library_t lib) {
+    const char * name = "kernel_qsa_expand_i32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, ggml_op op) {
     const char * name = nullptr;
 
@@ -1558,6 +1602,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_indexed(ggml_metal_library_t lib) {
+    const char * name = "kernel_flash_attn_ext_indexed_q8_0";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec(
         ggml_metal_library_t lib,
         const ggml_tensor * op,
@@ -2231,7 +2286,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_m
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_memset(ggml_metal_library_t lib, const ggml_tensor *  op) {
-    GGML_ASSERT(op->type == GGML_TYPE_I64);
+    GGML_ASSERT(op->type == GGML_TYPE_I64 || op->type == GGML_TYPE_F32);
 
     char base[256];
     char name[256];

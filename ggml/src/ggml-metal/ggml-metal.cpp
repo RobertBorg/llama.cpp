@@ -226,6 +226,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);
                 res += ggml_metal_op_mul_mat_id_extra_ids(tensor);
             } break;
+        case GGML_OP_QSA_INDEXER:
+            {
+                res += ggml_metal_op_qsa_indexer_extra(tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
@@ -689,6 +693,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ true,
         /* .mmap_support         = */ true,
+        /* .mul_mat_id_masked    = */ getenv("GGML_METAL_MUL_MAT_ID_MASKED_DISABLE") == nullptr,
     };
 }
 

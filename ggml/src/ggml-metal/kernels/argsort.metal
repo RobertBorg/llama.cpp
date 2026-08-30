@@ -230,3 +230,181 @@ kernel void kernel_argsort_merge_f32_i32(
 
 template [[host_name("kernel_argsort_merge_f32_i32_asc")]]  kernel argsort_merge_t kernel_argsort_merge_f32_i32<GGML_SORT_ORDER_ASC>;
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<GGML_SORT_ORDER_DESC>;
+
+static inline bool qsa_score_before(
+        device const float * scores,
+        int32_t              lhs,
+        int32_t              rhs) {
+    if (lhs < 0) {
+        return false;
+    }
+    if (rhs < 0) {
+        return true;
+    }
+
+    const float lhs_score = scores[lhs];
+    const float rhs_score = scores[rhs];
+
+    return lhs_score > rhs_score || (lhs_score == rhs_score && lhs < rhs);
+}
+
+kernel void kernel_qsa_top_k_f32_i32(
+        constant   ggml_metal_kargs_argsort & args,
+        device   const char * scores,
+        device      int32_t * dst,
+        threadgroup int32_t * shared [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int col = tpitg.x;
+    const int ib  = tgpig.x/args.ne01;
+
+    const int i00 = ib*ntg.x;
+    const int i01 = tgpig.x%args.ne01;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    device const float * scores_row = (device const float *) (scores + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
+
+    shared[col] = i00 + col;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 2; k <= ntg.x; k *= 2) {
+        for (int j = k/2; j > 0; j /= 2) {
+            const int ixj = col ^ j;
+
+            if (ixj > col) {
+                const bool col_valid = shared[col] < args.ne00;
+                const bool ixj_valid = shared[ixj] < args.ne00;
+                const bool col_first = (col & k) == 0;
+
+                bool swap = false;
+                if (col_first) {
+                    swap = !col_valid || (ixj_valid && qsa_score_before(scores_row, shared[ixj], shared[col]));
+                } else {
+                    swap = !ixj_valid || (col_valid && qsa_score_before(scores_row, shared[col], shared[ixj]));
+                }
+
+                if (swap) {
+                    SWAP(shared[col], shared[ixj]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const int64_t i0 = ib*args.top_k;
+
+    if (i0 + col < args.ne0 && col < args.top_k) {
+        dst += i0 + args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+        dst[col] = shared[col];
+    }
+}
+
+kernel void kernel_qsa_top_k_merge_f32_i32(
+        constant ggml_metal_kargs_argsort_merge & args,
+        device const char    * scores,
+        device const int32_t * tmp,
+        device       int32_t * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int im  = tgpig.x/args.ne01;
+    const int i01 = tgpig.x%args.ne01;
+    const int i02 = tgpig.y;
+    const int i03 = tgpig.z;
+
+    const int start = im*(2*args.len);
+
+    const int len0  = MIN(args.len, MAX(0, args.ne0 - start));
+    const int len1  = MIN(args.len, MAX(0, args.ne0 - start - args.len));
+    const int total = len0 + len1;
+
+    device const int32_t * tmp0 = tmp + start
+        + i01*args.ne0
+        + i02*args.ne0*args.ne01
+        + i03*args.ne0*args.ne01*args.ne02;
+    device const int32_t * tmp1 = tmp0 + args.len;
+
+    dst += start
+        + i01*args.top_k
+        + i02*args.top_k*args.ne01
+        + i03*args.top_k*args.ne01*args.ne02;
+
+    device const float * scores_row = (device const float *) (scores
+        + args.nb01*i01
+        + args.nb02*i02
+        + args.nb03*i03);
+
+    if (total == 0) {
+        return;
+    }
+
+    const int chunk = (total + ntg.x - 1)/ntg.x;
+    const int k0    = tpitg.x*chunk;
+    const int k1    = MIN(MIN(k0 + chunk, total), args.top_k);
+
+    if (k0 >= total || k0 >= args.top_k) {
+        return;
+    }
+
+    int low  = k0 > len1 ? k0 - len1 : 0;
+    int high = MIN(k0, len0);
+
+    while (low < high) {
+        const int mid = (low + high)/2;
+
+        const int32_t idx0 = tmp0[mid];
+        const int32_t idx1 = tmp1[k0 - mid - 1];
+
+        if (qsa_score_before(scores_row, idx0, idx1)) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    int i = low;
+    int j = k0 - i;
+
+    int32_t idx0 = 0;
+    if (i < len0) {
+        idx0 = tmp0[i];
+    }
+
+    int32_t idx1 = 0;
+    if (j < len1) {
+        idx1 = tmp1[j];
+    }
+
+    for (int k = k0; k < k1; ++k) {
+        if (i >= len0) {
+            while (k < k1) {
+                dst[k++] = tmp1[j++];
+            }
+            break;
+        }
+        if (j >= len1) {
+            while (k < k1) {
+                dst[k++] = tmp0[i++];
+            }
+            break;
+        }
+
+        if (qsa_score_before(scores_row, idx0, idx1)) {
+            dst[k] = idx0;
+            ++i;
+            if (i < len0) {
+                idx0 = tmp0[i];
+            }
+        } else {
+            dst[k] = idx1;
+            ++j;
+            if (j < len1) {
+                idx1 = tmp1[j];
+            }
+        }
+    }
+}

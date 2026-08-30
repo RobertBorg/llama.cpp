@@ -4737,12 +4737,13 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const int n_masked;
+    const bool masked;
 
     std::string vars() override {
-        if (n_masked == 0) {
+        if (!masked) {
             return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
         }
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, n_masked);
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, n_masked, masked);
     }
 
     double max_nmse_err() override {
@@ -4764,9 +4765,9 @@ struct test_mul_mat_id : public test_case {
 
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
-            int64_t m = 32, int64_t n = 32, int64_t k = 32, int n_masked = 0)
+            int64_t m = 32, int64_t n = 32, int64_t k = 32, int n_masked = 0, bool masked = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), n_masked(n_masked) {
+            m(m), n(n), k(k), n_masked(n_masked), masked(masked || n_masked > 0) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(n_masked >= 0 && n_masked <= n_used);
         }
@@ -4787,7 +4788,7 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
-        if (n_masked > 0) {
+        if (masked) {
             GGML_ASSERT(!ggml_mul_mat_id_get_masked(out));
             ggml_mul_mat_id_set_masked(out, true);
             GGML_ASSERT(ggml_mul_mat_id_get_masked(out));
@@ -4823,7 +4824,7 @@ struct test_mul_mat_id : public test_case {
     }
 
     bool run_whole_graph() override {
-        return n_masked > 0;
+        return masked;
     }
 
     double err(const float * a, const float * b, size_t n_values) override {
@@ -7904,14 +7905,18 @@ struct test_lightning_indexer : public test_case {
 struct test_qsa_indexer : public test_case {
     static constexpr int64_t hsk          = 128;
     static constexpr int64_t nh           = 4;
-    static constexpr int64_t n_blocks     = 1031;
-    static constexpr int64_t n_queries    = 8;
-    static constexpr int64_t n_lanes      = 2;
     static constexpr int64_t block_size   = 4;
     static constexpr int64_t token_top_k  = 2048;
     static constexpr int64_t block_top_k  = token_top_k/block_size;
-    static constexpr int64_t n_block_cells = block_size*n_blocks;
     static constexpr int64_t n_ids         = token_top_k + block_size - 1;
+
+    const int64_t n_blocks;
+    const int64_t n_queries;
+    const int64_t n_lanes;
+    const int64_t n_block_cells;
+
+    test_qsa_indexer(int64_t n_blocks, int64_t n_queries = 8, int64_t n_lanes = 2)
+        : n_blocks(n_blocks), n_queries(n_queries), n_lanes(n_lanes), n_block_cells(block_size*n_blocks) {}
 
     std::string vars() override {
         return VARS_TO_STR8(hsk, nh, n_blocks, n_queries, n_lanes, block_size, token_top_k, n_ids);
@@ -7963,10 +7968,20 @@ struct test_qsa_indexer : public test_case {
         std::vector<int32_t> tail_data((block_size - 1)*n_queries*n_lanes, -1);
         std::vector<int32_t> expected_data(n_ids*n_queries*n_lanes, -1);
 
-        const std::array<int32_t, n_queries> visible_lane_0 = { 0, 1, 3, 511, 512, 513, 1030, 1031 };
-        const std::array<int32_t, n_queries> visible_lane_1 = { 1031, 1030, 513, 512, 511, 3, 1, 0 };
+        const int32_t visible_top_k_m1 = (int32_t) std::min<int64_t>(block_top_k - 1, n_blocks);
+        const int32_t visible_top_k    = (int32_t) std::min<int64_t>(block_top_k,     n_blocks);
+        const int32_t visible_top_k_p1 = (int32_t) std::min<int64_t>(block_top_k + 1, n_blocks);
+        const int32_t visible_last     = (int32_t) (n_blocks - 1);
+        const int32_t visible_all      = (int32_t) n_blocks;
 
-        auto key_value = [](int64_t block, int64_t query, int64_t lane) {
+        const std::array<int32_t, 8> visible_lane_0 = {
+            0, 1, 3, visible_top_k_m1, visible_top_k, visible_top_k_p1, visible_last, visible_all,
+        };
+        const std::array<int32_t, 8> visible_lane_1 = {
+            visible_all, visible_last, visible_top_k_p1, visible_top_k, visible_top_k_m1, 3, 1, 0,
+        };
+
+        auto key_value = [this](int64_t block, int64_t query, int64_t lane) {
             if ((query == 7 && lane == 0) || (query == 0 && lane == 1)) {
                 return 1.0f + (float) (block/2);
             }
@@ -7981,11 +7996,14 @@ struct test_qsa_indexer : public test_case {
 
         for (int64_t lane = 0; lane < n_lanes; ++lane) {
             for (int64_t query = 0; query < n_queries; ++query) {
+                const int64_t feature = query % hsk;
                 for (int64_t head = 0; head < nh; ++head) {
-                    q_data[query*hsk*nh + head*hsk + query + lane*hsk*nh*n_queries] = 1.0f;
+                    q_data[query*hsk*nh + head*hsk + feature + lane*hsk*nh*n_queries] = 1.0f;
                 }
+            }
+            for (int64_t feature = 0; feature < hsk; ++feature) {
                 for (int64_t block = 0; block < n_blocks; ++block) {
-                    k_data[query + block*hsk + lane*hsk*n_blocks] = key_value(block, query, lane);
+                    k_data[feature + block*hsk + lane*hsk*n_blocks] = key_value(block, feature, lane);
                 }
             }
 
@@ -7995,7 +8013,9 @@ struct test_qsa_indexer : public test_case {
 
             for (int64_t query = 0; query < n_queries; ++query) {
                 const int64_t row = query + lane*n_queries;
-                const int32_t n_visible = lane == 0 ? visible_lane_0[query] : visible_lane_1[query];
+                const int64_t feature = query % hsk;
+                const size_t visible_index = query % visible_lane_0.size();
+                const int32_t n_visible = lane % 2 == 0 ? visible_lane_0[visible_index] : visible_lane_1[visible_index];
                 visible_data[row] = n_visible;
 
                 const int64_t n_tail = (query + 2*lane) % block_size;
@@ -8006,7 +8026,7 @@ struct test_qsa_indexer : public test_case {
                 std::vector<std::pair<float, int32_t>> ranked;
                 ranked.reserve(n_visible);
                 for (int32_t block = 0; block < n_visible; ++block) {
-                    const float score = 4.0f*std::max(key_value(block, query, lane), 0.0f);
+                    const float score = 4.0f*std::max(key_value(block, feature, lane), 0.0f);
                     ranked.emplace_back(score, block);
                 }
                 std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
@@ -8051,7 +8071,7 @@ struct test_qsa_indexer : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        GGML_ASSERT(n == 2*n_ids*n_queries*n_lanes);
+        GGML_ASSERT(n == (size_t) (2*n_ids*n_queries*n_lanes));
 
         double result = 0.0;
         const size_t n_rows = n_queries*n_lanes;
@@ -8067,6 +8087,115 @@ struct test_qsa_indexer : public test_case {
             }
         }
         return result;
+    }
+};
+
+struct test_qsa_indexed_attn : public test_case {
+    static constexpr bool    chain        = true;
+    static constexpr int64_t qsa_hsk      = 128;
+    static constexpr int64_t attn_hsk     = 256;
+    static constexpr int64_t nh           = 4;
+    static constexpr int64_t nr2          = 12;
+    static constexpr int64_t n_blocks     = 1031;
+    static constexpr int64_t nq           = 3;
+    static constexpr int64_t nseq         = 2;
+    static constexpr int64_t block_size   = 4;
+    static constexpr int64_t token_top_k  = 2048;
+    static constexpr int64_t n_ids        = token_top_k + block_size - 1;
+    static constexpr int64_t kv           = block_size*n_blocks;
+
+    std::string vars() override {
+        return VARS_TO_STR5(chain, n_blocks, nq, nseq, n_ids);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FLASH_ATTN_EXT_INDEXED";
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_index = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, qsa_hsk, nh, nq, nseq);
+        ggml_set_name(q_index, "q_index");
+
+        ggml_tensor * k_index = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, qsa_hsk, n_blocks, 1, nseq);
+        ggml_set_name(k_index, "k_index");
+
+        ggml_tensor * block_cells = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, kv, 1, 1, nseq);
+        ggml_set_name(block_cells, "block_cells");
+
+        ggml_tensor * visible = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1, nq, 1, nseq);
+        ggml_set_name(visible, "visible");
+
+        ggml_tensor * tail = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, block_size - 1, nq, 1, nseq);
+        ggml_set_name(tail, "tail");
+
+        ggml_tensor * ids = ggml_qsa_indexer(
+                ctx, q_index, k_index, block_cells, visible, tail, block_size, token_top_k);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, attn_hsk, nq, nh*nr2, nseq);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, attn_hsk, kv, nh, nseq);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_Q8_0, attn_hsk, kv, nh, nseq);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * out = ggml_flash_attn_ext_indexed(ctx, q, k, v, ids, 1.0f/sqrtf(attn_hsk));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::vector<float> q_index_data(qsa_hsk*nh*nq*nseq, 0.0f);
+        std::vector<float> k_index_data(qsa_hsk*n_blocks*nseq, 0.0f);
+        std::vector<int32_t> block_cells_data(kv*nseq);
+        std::vector<int32_t> visible_data(nq*nseq, n_blocks);
+        std::vector<int32_t> tail_data((block_size - 1)*nq*nseq);
+
+        for (int64_t sequence = 0; sequence < nseq; ++sequence) {
+            for (int64_t query = 0; query < nq; ++query) {
+                const int64_t row = query + sequence*nq;
+                for (int64_t head = 0; head < nh; ++head) {
+                    q_index_data[query*qsa_hsk*nh + head*qsa_hsk + query + sequence*qsa_hsk*nh*nq] = 1.0f;
+                }
+                for (int64_t block = 0; block < n_blocks; ++block) {
+                    k_index_data[query + block*qsa_hsk + sequence*qsa_hsk*n_blocks] =
+                            1.0f + (float) ((block + 73*query + 211*sequence) % n_blocks);
+                }
+                for (int64_t member = 0; member < block_size - 1; ++member) {
+                    tail_data[member + (block_size - 1)*row] = (int32_t) (kv - 1 - 3*row - member);
+                }
+            }
+            for (int64_t cell = 0; cell < kv; ++cell) {
+                block_cells_data[cell + sequence*kv] = (int32_t) cell;
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q_index") == 0) {
+                ggml_backend_tensor_set(t, q_index_data.data(), 0, q_index_data.size()*sizeof(float));
+            } else if (strcmp(t->name, "k_index") == 0) {
+                ggml_backend_tensor_set(t, k_index_data.data(), 0, k_index_data.size()*sizeof(float));
+            } else if (strcmp(t->name, "block_cells") == 0) {
+                ggml_backend_tensor_set(t, block_cells_data.data(), 0, block_cells_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "visible") == 0) {
+                ggml_backend_tensor_set(t, visible_data.data(), 0, visible_data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tail") == 0) {
+                ggml_backend_tensor_set(t, tail_data.data(), 0, tail_data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool run_whole_graph() override {
+        return true;
     }
 };
 
@@ -9818,6 +9947,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4, 4, false, 64, 2, 256, 4));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4, 4, true,  64, 3, 256, 2));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4, 4, true,  64, 2, 256, 4));
+    for (int64_t n : {31, 32}) {
+        for (int n_masked : {0, 5, 10}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 10, 10, true,  64, n, 256, n_masked, true));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 10, 10, false, 64, n, 256, n_masked, true));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS,  GGML_TYPE_F32, 10, 10, true,  64, n, 256, n_masked, true));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,    GGML_TYPE_F32, 10, 10, false, 64, n, 256, n_masked, true));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 10, 10, true,  64, 256, 256, 5, true));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL,  GGML_TYPE_F32, 10, 10, false, 64, 256, 256, 5, true));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -10594,7 +10733,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(2));
 #endif
 
-    test_cases.emplace_back(new test_qsa_indexer());
+    test_cases.emplace_back(new test_qsa_indexer(512));
+    test_cases.emplace_back(new test_qsa_indexer(1031));
+    test_cases.emplace_back(new test_qsa_indexer(2051));
+    test_cases.emplace_back(new test_qsa_indexer(8192));
+    test_cases.emplace_back(new test_qsa_indexer(8193));
+    test_cases.emplace_back(new test_qsa_indexed_attn());
+
+    if (getenv("GGML_TEST_QSA_LONG")) {
+        test_cases.emplace_back(new test_qsa_indexer(65536));
+        test_cases.emplace_back(new test_qsa_indexer(65536, 342, 1));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed(
+                    256, 256, 1, 12, 262144, 1, 2051, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true));
+    }
 
     // lightning_indexer
     for (int kv : { 256 }) {

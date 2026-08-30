@@ -15,12 +15,12 @@ This document tracks the remaining cross-backend work for the `qwen4exp` impleme
 ## Apple Silicon and Metal
 
 - [ ] Add forced-Metal regressions for PLE chunk history, unified QSA lanes, recurrent rollback, MTP, expert streaming, and prefix restoration.
-- [ ] Implement masked `MUL_MAT_ID` in both Metal expert matrix-vector and matrix-matrix paths. Sentinel routes must produce exact zeroes.
-- [ ] Cover all, some, and no masked routes below and above Metal's 32-token MMID kernel crossover with the quantization types used by the released model.
-- [ ] Advertise masked MMID support only after the operator tests pass, then verify expert waves no longer clamp the physical ubatch.
+- [x] Implement masked `MUL_MAT_ID` in both Metal expert matrix-vector and matrix-matrix paths. Sentinel routes must produce exact zeroes.
+- [x] Cover all, some, and no masked routes below and above Metal's 32-token MMID kernel crossover with the quantization types used by the released model.
+- [x] Advertise masked MMID support only after the operator tests pass, then verify expert waves no longer clamp the physical ubatch.
 - [ ] Adapt a packed scalar-gate GDN kernel for `Dk = 128` while retaining the serial kernel for unsupported shapes and rollback modes.
 - [ ] Extend the optimized Metal GDN path to `K > 1` only after the K=4 rollback oracle passes.
-- [ ] Implement Metal QSA index selection and indexed flash attention. Keep dense QSA as the fallback until both operators pass long-context tests.
+- [x] Implement Metal QSA index selection and indexed flash attention. Keep dense QSA as the fallback until both operators pass long-context tests.
 - [ ] Profile macOS expert reads and cache uploads. Evaluate uncached reads and direct reads into shared Metal storage after correctness is established.
 - [ ] Record M1 Pro operator and end-to-end baselines at short context and 32K, including peak unified-memory use.
 

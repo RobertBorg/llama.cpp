@@ -3137,6 +3137,10 @@ kernel void kernel_mul_mv_id(
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
 
+    if (args.masked && i02 == args.ne02) {
+        return;
+    }
+
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
 

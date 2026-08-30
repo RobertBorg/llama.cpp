@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <unordered_set>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1413,21 +1414,60 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 }
 
-void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
+llama_mmap::ranges llama_model_loader::get_mapping_ranges(void ** addr, int idx, ggml_context * ctx) const {
     GGML_ASSERT(!mappings.empty());
     const auto & mapping = mappings.at(idx);
 
-    *first = mapping->size();
-    *last  = 0;
     *addr = mapping->addr();
+
+    std::unordered_set<const llama_tensor_weight *> selected;
     for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
         const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != idx) {
+        if (weight && weight->idx == idx) {
+            selected.insert(weight);
+        }
+    }
+
+    std::vector<const llama_tensor_weight *> weights;
+    weights.reserve(weights_map.size());
+    for (const auto & [name, weight] : weights_map) {
+        GGML_UNUSED(name);
+        if (weight.idx == idx) {
+            weights.push_back(&weight);
+        }
+    }
+    std::sort(weights.begin(), weights.end(), [](const llama_tensor_weight * a, const llama_tensor_weight * b) {
+        return a->offs < b->offs;
+    });
+
+    llama_mmap::ranges ranges;
+    size_t first = 0;
+    size_t last  = 0;
+    bool active  = false;
+
+    for (const auto * weight : weights) {
+        if (selected.count(weight) == 0) {
+            if (active) {
+                ranges.emplace_back(first, last);
+                active = false;
+            }
             continue;
         }
-        *first = std::min(*first, weight->offs);
-        *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+
+        const size_t end = weight->offs + ggml_nbytes(weight->tensor);
+        if (!active) {
+            first = weight->offs;
+            last  = end;
+            active = true;
+        } else {
+            last = std::max(last, end);
+        }
     }
+    if (active) {
+        ranges.emplace_back(first, last);
+    }
+
+    return ranges;
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
@@ -1497,7 +1537,8 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        const auto buf_it = bufs.find(0);
+        auto * buf = buf_it != bufs.end() ? buf_it->second : nullptr;
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1566,9 +1607,11 @@ bool llama_model_loader::load_all_data(
     }(__func__);
 
     if (upload_backend) {
+        const auto buf_it = bufs.find(0);
+        GGML_ASSERT(buf_it != bufs.end());
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(buf_it->second)),
             ggml_backend_name(upload_backend));
     }
 
@@ -1590,10 +1633,20 @@ bool llama_model_loader::load_all_data(
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+            const auto [first, last] = bufs.equal_range(weight->idx);
+            for (auto it = first; it != last; ++it) {
+                ggml_backend_buffer_t candidate = it->second;
+                const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(candidate);
+                const uintptr_t addr = (uintptr_t) data;
+                const size_t size = ggml_backend_buffer_get_size(candidate);
+                const size_t alloc_size = ggml_backend_buffer_get_alloc_size(candidate, cur);
+                if (addr >= base && addr - base <= size && alloc_size <= size - (addr - base)) {
+                    GGML_ASSERT(buf_mmap == nullptr);
+                    buf_mmap = candidate;
+                }
+            }
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {

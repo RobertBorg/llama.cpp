@@ -279,12 +279,17 @@ kernel void kernel_memset(
         constant ggml_metal_kargs_memset & args,
         device T * dst,
         uint tpig[[thread_position_in_grid]]) {
+    if (tpig >= args.ne) {
+        return;
+    }
     dst[tpig] = args.val;
 }
 
 typedef decltype(kernel_memset<int64_t>) kernel_memset_t;
+typedef decltype(kernel_memset<float>) kernel_memset_f32_t;
 
 template [[host_name("kernel_memset_i64")]] kernel kernel_memset_t kernel_memset<int64_t>;
+template [[host_name("kernel_memset_f32")]] kernel kernel_memset_f32_t kernel_memset<float>;
 
 constant short FC_count_equal_nsg [[function_constant(FC_COUNT_EQUAL + 0)]];
 

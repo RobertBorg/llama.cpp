@@ -1634,6 +1634,66 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
+        case GGML_OP_FLASH_ATTN_EXT_INDEXED:
+            {
+                if (getenv("GGML_METAL_QSA_DISABLE") != NULL) {
+                    return false;
+                }
+
+                const struct ggml_tensor * q   = op->src[0];
+                const struct ggml_tensor * k   = op->src[1];
+                const struct ggml_tensor * v   = op->src[2];
+                const struct ggml_tensor * ids = op->src[3];
+                if (!q || !k || !v || !ids) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q8_0 ||
+                        ids->type != GGML_TYPE_I32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (q->ne[0] != OP_FLASH_ATTN_EXT_INDEXED_D ||
+                        k->ne[0] != OP_FLASH_ATTN_EXT_INDEXED_D ||
+                        v->ne[0] != OP_FLASH_ATTN_EXT_INDEXED_D) {
+                    return false;
+                }
+                if (q->ne[1] <= 0 || q->ne[1] > INT32_MAX || q->ne[3] <= 0 || q->ne[3] > INT32_MAX ||
+                        k->ne[1] <= 0 || k->ne[1] > INT32_MAX ||
+                        k->ne[2] <= 0 || k->ne[2] > INT32_MAX/OP_FLASH_ATTN_EXT_INDEXED_GQA ||
+                        q->ne[2] != OP_FLASH_ATTN_EXT_INDEXED_GQA*k->ne[2] || v->ne[2] != k->ne[2]) {
+                    return false;
+                }
+                if (q->ne[3] != k->ne[3] || q->ne[3] != v->ne[3] || k->ne[1] != v->ne[1]) {
+                    return false;
+                }
+                if (ids->ne[0] <= 0 || ids->ne[0] > OP_FLASH_ATTN_EXT_INDEXED_MAX_IDS ||
+                        ids->ne[1] != q->ne[1] || ids->ne[2] != 1 || ids->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (op->ne[0] != OP_FLASH_ATTN_EXT_INDEXED_D || op->ne[1] != q->ne[2] ||
+                        op->ne[2] != q->ne[1] || op->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) ||
+                        k->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) || v->nb[0] != ggml_type_size(GGML_TYPE_Q8_0) ||
+                        ids->nb[0] != sizeof(int32_t)) {
+                    return false;
+                }
+                if (k->nb[1] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        k->nb[2] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        k->nb[3] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        v->nb[1] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        v->nb[2] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        v->nb[3] % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        k->view_offs % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0 ||
+                        v->view_offs % OP_FLASH_ATTN_EXT_INDEXED_ALIGNMENT != 0) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(ids) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+
+                return has_simdgroup_reduction;
+            }
         case GGML_OP_LIGHTNING_INDEXER:
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK ||
                 op->src[0]->ne[1] != OP_LIGHTNING_INDEXER_NH) {
@@ -1663,6 +1723,68 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return has_bfloat;
                 default:
                     return false;
+            }
+        case GGML_OP_QSA_INDEXER:
+            {
+                if (getenv("GGML_METAL_QSA_DISABLE") != NULL) {
+                    return false;
+                }
+
+                const struct ggml_tensor * q           = op->src[0];
+                const struct ggml_tensor * k           = op->src[1];
+                const struct ggml_tensor * block_cells = op->src[2];
+                const struct ggml_tensor * visible     = op->src[3];
+                const struct ggml_tensor * tail        = op->src[4];
+                if (!q || !k || !block_cells || !visible || !tail) {
+                    return false;
+                }
+
+                const int32_t block_size = ggml_get_op_params_i32(op, 0);
+                const int32_t token_top_k = ggml_get_op_params_i32(op, 1);
+                if (block_size != OP_QSA_INDEXER_BLOCK_SIZE || token_top_k != OP_QSA_INDEXER_TOKEN_TOP_K) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || block_cells->type != GGML_TYPE_I32 ||
+                        visible->type != GGML_TYPE_I32 || tail->type != GGML_TYPE_I32 || op->type != GGML_TYPE_I32) {
+                    return false;
+                }
+                if (q->ne[0] != OP_QSA_INDEXER_D || q->ne[1] != OP_QSA_INDEXER_NH || q->ne[2] <= 0 || q->ne[3] <= 0 ||
+                        k->ne[0] != OP_QSA_INDEXER_D || k->ne[1] < OP_QSA_INDEXER_BLOCK_TOP_K || k->ne[1] > INT32_MAX/OP_QSA_INDEXER_BLOCK_SIZE ||
+                        k->ne[2] != 1 || k->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (block_cells->ne[0] != OP_QSA_INDEXER_BLOCK_SIZE*k->ne[1] || block_cells->ne[1] != 1 ||
+                        block_cells->ne[2] != 1 || block_cells->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (visible->ne[0] != 1 || visible->ne[1] != q->ne[2] || visible->ne[2] != 1 || visible->ne[3] != q->ne[3] ||
+                        tail->ne[0] != OP_QSA_INDEXER_BLOCK_SIZE - 1 || tail->ne[1] != q->ne[2] ||
+                        tail->ne[2] != 1 || tail->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (op->ne[0] != OP_QSA_INDEXER_N_IDS || op->ne[1] != q->ne[2] || op->ne[2] != 1 || op->ne[3] != q->ne[3]) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) || k->nb[0] != sizeof(float) || block_cells->nb[0] != sizeof(int32_t) ||
+                        visible->nb[0] != sizeof(int32_t) || tail->nb[0] != sizeof(int32_t) || op->nb[0] != sizeof(int32_t) ||
+                        !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (q->ne[2] > INT32_MAX || q->ne[3] > INT32_MAX) {
+                    return false;
+                }
+
+                const int64_t n_rows = q->ne[2]*q->ne[3];
+                const int64_t max_row_elements = MAX(k->ne[1], (int64_t) OP_QSA_INDEXER_N_IDS);
+                if (n_rows > INT32_MAX/max_row_elements) {
+                    return false;
+                }
+                const int64_t scratch_size = 3*GGML_PAD(sizeof(float)*k->ne[1], 32);
+                if (scratch_size > OP_QSA_INDEXER_MAX_SCRATCH) {
+                    return false;
+                }
+
+                return has_simdgroup_reduction;
             }
         case GGML_OP_DSV4_HC_COMB:
             return has_simdgroup_reduction &&
