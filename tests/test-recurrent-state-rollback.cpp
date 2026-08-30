@@ -6,6 +6,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
@@ -33,6 +34,105 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
+}
+
+static bool test_speculative_prefill_rollback(const common_params & params, llama_model * model, const int n_vocab) {
+    char architecture[32];
+    if (llama_model_meta_val_str(model, "general.architecture", architecture, sizeof(architecture)) < 0 ||
+        strcmp(architecture, "qwen4exp") != 0) {
+        return true;
+    }
+
+    constexpr uint32_t n_rs_seq = 3;
+    constexpr uint32_t n_prompt = 65;
+    constexpr uint32_t n_verify = n_rs_seq + 1;
+
+    const auto make_ctx_spec = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max = 1;
+        cparams.n_rs_seq  = n_rs_seq;
+        cparams.n_ctx     = std::max(cparams.n_ctx,     n_prompt + n_verify + 1);
+        cparams.n_batch   = std::max(cparams.n_batch,   n_prompt + n_verify + 1);
+        cparams.n_ubatch  = std::max(cparams.n_ubatch,  n_prompt + n_verify + 1);
+        return llama_init_from_model(model, cparams);
+    };
+
+    llama_context * ctx_roll = make_ctx_spec();
+    llama_context * ctx_ref  = make_ctx_spec();
+    if (ctx_roll == nullptr || ctx_ref == nullptr) {
+        fprintf(stderr, "%s : failed to init speculative contexts\n", __func__);
+        llama_free(ctx_roll);
+        llama_free(ctx_ref);
+        return false;
+    }
+
+    const auto cleanup = [&]() {
+        llama_free(ctx_roll);
+        llama_free(ctx_ref);
+    };
+
+    if (llama_n_rs_seq(ctx_roll) < n_rs_seq || n_vocab <= 0) {
+        fprintf(stderr, "%s : speculative rollback is unavailable\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    std::vector<llama_token> tokens(n_prompt + n_verify + 1);
+    for (uint32_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = (llama_token) ((17 * i + 1) % (uint32_t) n_vocab);
+    }
+
+    if (!decode_tokens(ctx_roll, tokens, n_prompt) || !decode_tokens(ctx_ref, tokens, n_prompt)) {
+        fprintf(stderr, "%s : speculative prefill failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    llama_batch batch = llama_batch_init(n_verify, 0, 1);
+    for (uint32_t i = 0; i < n_verify; ++i) {
+        const llama_pos pos = n_prompt + i;
+        common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == n_verify);
+    }
+    const bool verify_ok = llama_decode(ctx_roll, batch) == 0;
+    llama_batch_free(batch);
+
+    if (!verify_ok || !decode_one(ctx_ref, tokens[n_prompt], n_prompt)) {
+        fprintf(stderr, "%s : speculative verification failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    const llama_pos rollback_pos = n_prompt + 1;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, rollback_pos, -1) ||
+        !decode_one(ctx_roll, tokens[rollback_pos], rollback_pos) ||
+        !decode_one(ctx_ref,  tokens[rollback_pos], rollback_pos)) {
+        fprintf(stderr, "%s : speculative rejection failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    const float * logits_roll = llama_get_logits_ith(ctx_roll, 0);
+    const float * logits_ref  = llama_get_logits_ith(ctx_ref, 0);
+    float diff_max = 0.0f;
+    if (logits_roll == nullptr || logits_ref == nullptr) {
+        fprintf(stderr, "%s : speculative continuation logits are missing\n", __func__);
+        cleanup();
+        return false;
+    }
+    for (int token = 0; token < n_vocab; ++token) {
+        diff_max = std::max(diff_max, std::fabs(logits_roll[token] - logits_ref[token]));
+    }
+
+    constexpr float eps = 1e-5f;
+    if (diff_max > eps) {
+        fprintf(stderr, "%s : speculative rollback logits mismatch (max diff %g)\n", __func__, (double) diff_max);
+        cleanup();
+        return false;
+    }
+
+    fprintf(stderr, "%s : speculative rollback matched (max diff %g)\n", __func__, (double) diff_max);
+    cleanup();
+    return true;
 }
 
 // Roll back multiple sequences, then replay them in a single batch whose
@@ -394,6 +494,10 @@ int main(int argc, char ** argv) {
     llama_free(ctx_dirty);
 
     if (!test_multi_seq_split_replay(params, model, n_vocab)) {
+        return 1;
+    }
+
+    if (!test_speculative_prefill_rollback(params, model, n_vocab)) {
         return 1;
     }
 

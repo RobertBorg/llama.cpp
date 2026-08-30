@@ -79,13 +79,19 @@ static __device__ __forceinline__ float gdn_exp2(float x) {
 #endif
 }
 
-bool ggml_cuda_gdn_chunked_supported(bool kda, bool keep_rs, int64_t S_v, int64_t n_tokens) {
+bool ggml_cuda_gdn_chunked_supported(
+        bool kda, bool split_tail, int64_t S_v, int64_t n_tokens, int64_t n_heads, int64_t n_seqs) {
     static const bool enabled = []() {
         const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
         return env == nullptr || std::atoi(env) != 0;
     }();
 
-    if (!enabled || kda || keep_rs || S_v != GDN_HEAD_DIM || n_tokens <= GDN_CHUNK) {
+    if (!enabled || kda || S_v != GDN_HEAD_DIM || n_tokens <= GDN_CHUNK) {
+        return false;
+    }
+
+    // The split path needs two chunks and 32 persistent blocks to amortize its second launch.
+    if (split_tail && (n_tokens < 2 * GDN_CHUNK || n_heads * n_seqs < 32)) {
         return false;
     }
 
@@ -112,6 +118,7 @@ gdn_chunked_f32(const float * __restrict__ q,
                 float       * __restrict__ state_out,
                 const int64_t n_tokens,
                 const int64_t n_heads,
+                const int64_t dst_seq_stride,
                 const int64_t sq1, const int64_t sq2, const int64_t sq3,
                 const int64_t sv1, const int64_t sv2, const int64_t sv3,
                 const int64_t sb1, const int64_t sb2, const int64_t sb3,
@@ -352,7 +359,7 @@ gdn_chunked_f32(const float * __restrict__ q,
             out1 = gdn_sum_to_lane0(out1);
 
             if (col_lane == 0 && i < n_valid) {
-                const int64_t dst_off = ((int64_t) sequence * n_tokens + tok0 + i) * n_heads * HEAD_DIM
+                const int64_t dst_off = (int64_t) sequence * dst_seq_stride + (tok0 + i) * n_heads * HEAD_DIM
                                       + (int64_t) head * HEAD_DIM;
                 // col0 is even and HEAD_DIM is even, so the pair is 8-byte aligned
                 *(float2 *) &dst[dst_off + col0] = make_float2(out0, out1);
@@ -400,18 +407,21 @@ void ggml_cuda_gdn_chunked(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_
 
     ggml_cuda_kernel_launch(gdn_chunked_f32, launch_params,
         args.q, args.k, args.v, args.g, args.beta, args.state_in, args.dst, args.state_out,
-        args.n_tokens, args.H,
+        args.n_tokens, args.H, args.dst_seq_stride,
         args.sq1, args.sq2, args.sq3, args.sv1, args.sv2, args.sv3, args.sb1, args.sb2, args.sb3,
         neqk1_magic, rq3_magic, args.scale);
 }
 
 #else
 
-bool ggml_cuda_gdn_chunked_supported(bool kda, bool keep_rs, int64_t S_v, int64_t n_tokens) {
+bool ggml_cuda_gdn_chunked_supported(
+        bool kda, bool split_tail, int64_t S_v, int64_t n_tokens, int64_t n_heads, int64_t n_seqs) {
     (void) kda;
-    (void) keep_rs;
+    (void) split_tail;
     (void) S_v;
     (void) n_tokens;
+    (void) n_heads;
+    (void) n_seqs;
     return false;
 }
 

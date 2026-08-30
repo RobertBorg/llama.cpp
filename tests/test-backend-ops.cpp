@@ -10565,8 +10565,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 192, 3, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 520, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 2080, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 67, 4, 2, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 68, 4, 2, false, false, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache());
+    test_cases.emplace_back(new test_gated_delta_net_cache(2, 68, 4, 4, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache(2, 65, 2, 4, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache(2, 73, 4, 4, 9));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -10992,6 +10996,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 256, 1, 4)); // Qwen3.8 Flash Next PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 2048, 1, 4)); // Qwen3.8 Flash Next PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 2552, 1, 4)); // Qwen3.8 Flash Next PP-2552
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 256, 1, 4, false, false, 4)); // Qwen3.8 Flash Next speculative PP-256
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 2048, 1, 4, false, false, 4)); // Qwen3.8 Flash Next speculative PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
     // lightning_indexer

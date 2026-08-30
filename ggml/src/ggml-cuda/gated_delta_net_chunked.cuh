@@ -17,6 +17,7 @@ struct ggml_cuda_gdn_chunked_args {
     int64_t H;
     int64_t n_tokens;
     int64_t n_seqs;
+    int64_t dst_seq_stride;
 
     // strides in elements
     int64_t sq1, sq2, sq3;
@@ -29,6 +30,7 @@ struct ggml_cuda_gdn_chunked_args {
     float scale;
 };
 
-bool ggml_cuda_gdn_chunked_supported(bool kda, bool keep_rs, int64_t S_v, int64_t n_tokens);
+bool ggml_cuda_gdn_chunked_supported(
+        bool kda, bool split_tail, int64_t S_v, int64_t n_tokens, int64_t n_heads, int64_t n_seqs);
 
 void ggml_cuda_gdn_chunked(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_chunked_args & args);
