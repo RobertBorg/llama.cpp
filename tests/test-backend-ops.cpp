@@ -4410,6 +4410,55 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+struct test_gated_delta_net_cache : public test_gated_delta_net {
+    ggml_tensor * attention {};
+    ggml_tensor * cache_update {};
+
+    test_gated_delta_net_cache(int64_t head_count = 2, int64_t n_seq_tokens = 65, int64_t n_seqs = 4,
+            int v_repeat = 4, int64_t K = 4)
+        : test_gated_delta_net(GGML_TYPE_F32, head_count, 128, n_seq_tokens, n_seqs, v_repeat, false, false, K) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_CACHE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attention, cache_update }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gdn = test_gated_delta_net::build_graph(ctx);
+
+        const int64_t n_value_heads = head_count * v_repeat;
+        const int64_t state_size    = head_size * head_size * n_value_heads;
+        const int64_t mem_size      = n_seqs + 2;
+        const int64_t kv_head       = 1;
+
+        attention = ggml_view_4d(ctx, gdn,
+            head_size, n_value_heads, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn->type, head_size),
+            ggml_row_size(gdn->type, head_size * n_value_heads),
+            ggml_row_size(gdn->type, head_size * n_value_heads * n_seq_tokens), 0);
+
+        const int64_t attention_size = head_size * n_value_heads * n_seq_tokens * n_seqs;
+        ggml_tensor * snapshots = ggml_view_3d(ctx, gdn,
+            state_size, n_seqs, K,
+            ggml_row_size(gdn->type, state_size),
+            ggml_row_size(gdn->type, state_size * n_seqs),
+            ggml_row_size(gdn->type, attention_size));
+
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, state_size, mem_size, K);
+        ggml_tensor * cache_view = ggml_view_3d(ctx, cache,
+            state_size, n_seqs, K,
+            cache->nb[1], cache->nb[2],
+            kv_head * cache->nb[1]);
+        cache_update = ggml_cpy(ctx, snapshots, cache_view);
+
+        return ggml_add(ctx, ggml_sum(ctx, attention), ggml_sum(ctx, ggml_cont(ctx, cache_update)));
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10508,6 +10557,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
+    // Scalar GDN chunk boundaries and grouped value heads.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  32, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  33, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128,  65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 130, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 192, 3, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  8, 128, 520, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128, 2080, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache());
+    test_cases.emplace_back(new test_gated_delta_net_cache(2, 65, 2, 4, 1));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
@@ -10930,6 +10989,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 256, 1, 4)); // Qwen3.8 Flash Next PP-256
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 2048, 1, 4)); // Qwen3.8 Flash Next PP-2048
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 12, 128, 2552, 1, 4)); // Qwen3.8 Flash Next PP-2552
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
     // lightning_indexer
